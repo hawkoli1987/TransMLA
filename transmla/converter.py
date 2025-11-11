@@ -24,7 +24,7 @@ def load_model_and_tokenizer(args):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    assert model.config.model_type in ["llama", "qwen2", "mistral", "mimo"] or not args.deepseek_style
+    assert model.config.model_type in ["llama", "qwen2", "qwen3", "mistral", "mimo"] or not args.deepseek_style
 
     return model, tokenizer
 

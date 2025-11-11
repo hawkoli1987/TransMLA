@@ -39,6 +39,14 @@ settings = {
     }
 }
 settings["qwen2"] = settings["llama"]
+settings["qwen3"] = {
+    "auto_map": {
+        "AutoConfig": "configuration_qwen3mla.Qwen3MLAConfig",
+        "AutoModel": "modeling_qwen3mla.Qwen3MLAModel",
+        "AutoModelForCausalLM": "modeling_qwen3mla.Qwen3MLAForCausalLM"
+    },
+    "architectures": ["Qwen3MLAForCausalLM"],
+}
 settings["mistral"] = settings["llama"]
 settings["mimo"] = settings["llama"]
 
@@ -49,6 +57,7 @@ transformers_dirs = {
     "deepseek_v3": "transmla/transformers/deepseek_v3", 
 }
 transformers_dirs["qwen2"] = transformers_dirs["llama"]
+transformers_dirs["qwen3"] = "transmla/transformers/qwen3"
 transformers_dirs["mistral"] = transformers_dirs["llama"]
 mla_dir = "transmla/transformers/mla.py"
 
