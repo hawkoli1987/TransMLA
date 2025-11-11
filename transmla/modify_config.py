@@ -92,5 +92,7 @@ def modify_config(model, config_path: str, args):
     transformers_dir = transformers_dirs[model_type]
     for item in os.listdir(transformers_dir):
         source_path = os.path.join(transformers_dir, item)
+        if os.path.isdir(source_path):
+            continue
         shutil.copy(source_path, args.save_path)
     shutil.copy(mla_dir, args.save_path)
