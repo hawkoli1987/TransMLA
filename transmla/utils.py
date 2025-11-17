@@ -389,24 +389,55 @@ def pca_calc(X: list[torch.Tensor], device: str) -> torch.Tensor:
     H = None
     for idx, X_batch in enumerate(X):
 
+        # X_batch is the batch of activations, shape [B, N, D]
         X_batch = X_batch.double().to(device)
+        # H_batch is the covariance matrix of the batch, shape [B, D, D] (after matmal), 
+        # changed to [D, D] after sum
         H_batch = torch.sum(X_batch.mT @ X_batch, dim=0)  # sum over the batch dimension.
         H = H_batch if H is None else H + H_batch
 
+    # damp is the 0.01 * the diagonal mean
     damp = 0.01 * torch.mean(torch.diag(H))
     diag = torch.arange(H.shape[-1]).to(device)
+    # add the damp to the diagonal for numerical stability
     H[diag, diag] = H[diag, diag] + damp
+    # X_eig is a tuple of (eigenvalues, eigenvectors)
     X_eig = torch.linalg.eigh(H)
     del H
+    # sort the eigenvalues in descending order, index is shape D
     index = torch.argsort(X_eig[0], descending=True)
+    # sort the columns, because each column is an eigenvector
     eigen_vec = X_eig[1][:, index]
+    # return the eigenvectors, shape [D, D], sorted in descending order of eigenvalues along the columns
     return eigen_vec
 
 def statistics_qkv_rmsnorm(self_attn, q_a_outputs, kv_a_outputs):
+    """
+    Compute and set RMS normalization statistics for QKV projection layer norms.
+    
+    This function calculates RMS normalization statistics from calibration outputs
+    and initializes the layer normalization weights for query and key-value projections.
+    
+    Args:
+        self_attn: The self-attention module containing q_a_layernorm, kv_a_layernorm,
+                   q_a_proj, and kv_a_proj_with_mqa attributes.
+        q_a_outputs: List of tensors containing query projection outputs from calibration.
+                     If None, the query layer norm is not updated.
+        kv_a_outputs: List of tensors containing key-value projection outputs from calibration.
+                      Used to compute and set the KV layer norm weights.
+    
+    Note:
+        This function modifies the layer norm weight data in-place. The computed RMS norm
+        value is broadcast to all elements of the layer norm weight tensor.
+    """
     if q_a_outputs is not None:
+        # the layer norm weight was randomly initialized
         self_attn.q_a_layernorm.weight.data.to(self_attn.q_a_proj.weight.device).to(self_attn.dtype)
+        # cat along the 0th (batch) dimension, merge multiple batches into one
         q_a_proj = torch.cat(q_a_outputs)
+        # get the RMS of the hidden dimension
         q_a_rmsnorm = torch.rsqrt(q_a_proj.pow(2).mean(-1) + self_attn.q_a_layernorm.eps).mean()
+        # set the layer norm weight by scattering the RMS norm 
         self_attn.q_a_layernorm.weight.data = torch.full_like(self_attn.q_a_layernorm.weight.data, q_a_rmsnorm)
 
     self_attn.kv_a_layernorm.weight.data.to(self_attn.kv_a_proj_with_mqa.weight.device).to(self_attn.dtype)
