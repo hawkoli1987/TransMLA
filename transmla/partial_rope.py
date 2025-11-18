@@ -106,6 +106,43 @@ class PartialRope(nn.Module):
         return torch.stack(eigen_vecs+eigen_vecs).to(dtype)
 
     def rotate_k_proj(self, U, freqfold=1):
+        """
+        Rotate the RoPE portion of k_proj weights into the PCA basis.
+
+        Abbreviations:
+            nkvh = num_key_value_heads
+            hd = head_dim
+            ff = freqfold
+            col = collapse
+            hs = hidden_size
+
+        Step-by-step example (tensor shapes only; values omitted):
+            1. Original weight: [latent_dim, hs]
+            2. Reshape -> [nkvh, hd // ff, ff // col, col, hs]
+            3. Permute -> [col, nkvh, ff // col, hd // ff, hs]
+            4. Merge -> [nkvh * ff, hd // ff, hs]
+            5. Rotate -> einsum with U (shape [hd // ff, hd // ff])
+            6. Reshape -> [col, nkvh, ff // col, 2, hd // ff // 2, hs]
+            7. Permute -> [nkvh, hd, hs]
+            8. Flatten -> [latent_dim, hs] before storing
+
+        Concrete example (Qwen2.5-7B default settings):
+            - hidden_size (hs) = 3584
+            - num_attention_heads = 28, num_key_value_heads (nkvh) = 4
+            - head_dim (hd) = 128, qk_mqa_dim = 64 → collapse (col) = 2
+            - freqfold (ff) starts at col (2) and often doubles to 4
+
+            For ff = 4:
+                1. Original weight: [latent_dim=512, hs=3584]
+                2. Reshape -> [nkvh=4, hd//ff=32, ff//col=2, col=2, hs=3584]
+                3. Permute -> [2, 4, 2, 32, 3584]
+                4. Merge -> [nkvh*ff = 16, hd//ff = 32, hs = 3584]
+                5. Rotate with U: [32, 32]
+                6. Reshape -> [col=2, nkvh=4, ff//col=2, 2, hd//ff//2=16, hs=3584]
+                7. Permute -> [nkvh=4, hd=128, hs=3584]
+                8. Flatten -> [latent_dim=512, hs=3584]
+        """
+    def rotate_k_proj(self, U, freqfold=1):
         k_weight = deepcopy(self.k_proj.weight.data)
         U = U.to(k_weight.dtype).to(k_weight.device)
         if self.k_proj.bias is not None:

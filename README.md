@@ -135,6 +135,13 @@ python transmla/converter.py --model-path Qwen/Qwen2.5-7B-Instruct ...
      - Iteratively tests `freqfold` values: `collapse, collapse*2, collapse*4, ...`
      - For each freqfold, calls `partial_rope_freqfold()` and evaluates PPL
      - Selects freqfold with minimum PPL
+     
+   - **How freqfold works**
+     - `freqfold` controls how aggressively the RoPE (rotary position embedding) frequencies are *folded* (downsampled) before we rotate the key/value projections.
+     - In `PartialRope.__init__`, after PCA, we reshape `k_proj` weights into blocks of `[num_kv_heads, head_dim // freqfold, freqfold // collapse, collapse, ...]` and apply `rotate_k_proj()` so that every `freqfold` contiguous rotary channels share the same learned frequency basis.
+     - A larger `freqfold` → fewer distinct RoPE frequency bands → smaller effective RoPE dimension (since we keep just `head_dim // freqfold` unique bands). This reduces KV cache size but increases approximation error.
+     - When `freqfold` is smaller (closer to `collapse`), more frequency bands are preserved, so the converted model stays closer to the original but retains more KV cache.
+     - During auto-search, we start from `freqfold = collapse` (minimum folding) and keep doubling until perplexity stops improving. This balances KV compression with accuracy.
    
    - **Partial RoPE transformation**:
      - `partial_rope_freqfold(model, ori_qkv_outputs, test_loader, freqfold, collapse)`
