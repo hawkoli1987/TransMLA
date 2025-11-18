@@ -64,9 +64,6 @@ python3 transmla/converter.py \
     --save-path outputs/qwen3-4B-deepseek \
     --dtype bf16 \
     --device cpu \
-    --cal-nsamples 4 \
-    --cal-batch-size 1 \
-    --cal-max-seqlen 128 \
     --ppl-eval-batch-size 0 \
     --freqfold 4 \
     --collapse auto \
@@ -74,6 +71,8 @@ python3 transmla/converter.py \
     --q-lora-rank 512 \
     --kv-lora-rank 512
 ```
+
+**Note**: Calibration settings (`cal-nsamples`, `cal-batch-size`, `cal-max-seqlen`) use default values (128, 8, 256 respectively).
 
 ### Main Function
 **File**: `transmla/converter.py`  
@@ -442,9 +441,9 @@ For Qwen3-4B with default settings:
 | `kv_lora_rank` | 512 | Rank for key/value joint low-rank decomposition |
 | `freqfold` | 4 | RoPE frequency folding factor (auto-searched) |
 | `collapse` | auto | Collapse factor = head_dim / qk_mqa_dim = 128 / 64 = 2 |
-| `cal_nsamples` | 4 | Number of calibration samples |
-| `cal_batch_size` | 1 | Calibration batch size |
-| `cal_max_seqlen` | 128 | Maximum calibration sequence length |
+| `cal_nsamples` | 128 (default) | Number of calibration samples |
+| `cal_batch_size` | 8 (default) | Calibration batch size |
+| `cal_max_seqlen` | 256 (default) | Maximum calibration sequence length |
 
 ### Architecture Dimensions (Qwen3-4B)
 - `hidden_size`: 3,584

@@ -7,9 +7,9 @@ This document identifies all differences between the Qwen2.5 and Qwen3 conversio
 | Aspect | Qwen2.5 | Qwen3 |
 |--------|---------|-------|
 | **Model Files** | Uses LlamaMLA model files | Uses dedicated Qwen3MLA model files |
-| **Script Complexity** | Minimal (4 parameters) | Detailed (12+ parameters) |
-| **Default Arguments** | Relies on converter.py defaults | Explicitly overrides most defaults |
-| **Calibration Settings** | Default (128 samples, batch 8, seqlen 256) | Minimal (4 samples, batch 1, seqlen 128) |
+| **Script Complexity** | Minimal (4 parameters) | Detailed (9+ parameters) |
+| **Default Arguments** | Relies on converter.py defaults | Explicitly overrides some defaults |
+| **Calibration Settings** | Default (128 samples, batch 8, seqlen 256) | Default (128 samples, batch 8, seqlen 256) |
 | **Device** | Default "auto" | Explicitly "cpu" |
 | **Python Interpreter** | `python` | `python3` |
 | **Q LoRA Rank** | None (default) | 512 (explicit) |
@@ -52,9 +52,6 @@ python transmla/converter.py \
 ```bash
 model_path=Qwen/Qwen3-4B
 save_path=outputs/qwen3-4B-deepseek
-cal_nsamples=4
-cal_batch_size=1
-cal_max_seqlen=128
 freqfold=4
 eval_batch_size=0
 
@@ -63,9 +60,6 @@ python3 transmla/converter.py \
     --save-path $save_path \
     --dtype bf16 \
     --device cpu \
-    --cal-nsamples $cal_nsamples \
-    --cal-batch-size $cal_batch_size \
-    --cal-max-seqlen $cal_max_seqlen \
     --ppl-eval-batch-size $eval_batch_size \
     --freqfold $freqfold \
     --collapse auto \
@@ -75,11 +69,11 @@ python3 transmla/converter.py \
 ```
 
 **Characteristics**:
-- **Explicit configuration**: 12+ parameters explicitly set
-- **Minimal calibration**: Uses much smaller calibration dataset
-  - `cal-nsamples`: 4 (vs 128 default)
-  - `cal-batch-size`: 1 (vs 8 default)
-  - `cal-max-seqlen`: 128 (vs 256 default)
+- **Explicit configuration**: 9+ parameters explicitly set
+- **Standard calibration**: Uses default calibration settings (same as Qwen2.5)
+  - `cal-nsamples`: 128 (default)
+  - `cal-batch-size`: 8 (default)
+  - `cal-max-seqlen`: 256 (default)
 - **CPU device**: Explicitly sets `--device cpu` (vs "auto" default)
 - **Q LoRA enabled**: Sets `--q-lora-rank 512` (vs None default)
 - **No evaluation**: Sets `--ppl-eval-batch-size 0` (disables PPL evaluation)
@@ -144,9 +138,9 @@ settings["qwen3"] = {
 
 | Category | Parameter | Qwen2.5 | Qwen3 | Default |
 |----------|-----------|---------|-------|---------|
-| **Calibration** | `cal-nsamples` | 128 | **4** | 128 |
-| | `cal-batch-size` | 8 | **1** | 8 |
-| | `cal-max-seqlen` | 256 | **128** | 256 |
+| **Calibration** | `cal-nsamples` | 128 | 128 | 128 |
+| | `cal-batch-size` | 8 | 8 | 8 |
+| | `cal-max-seqlen` | 256 | 256 | 256 |
 | | `cal-dataset` | wikitext2 | wikitext2 | wikitext2 |
 | **Architecture** | `q-lora-rank` | **None** | **512** | None |
 | | `kv-lora-rank` | 512 | 512 | 512 |
@@ -213,10 +207,7 @@ transformers_dirs["qwen3"] = "transmla/transformers/qwen3"  # Line 60
 
 **No differences** - Both use the same `partial_rope()` function with identical logic.
 
-**Note**: The calibration dataset size difference affects:
-- Number of samples used for PCA computation
-- Time taken for calibration
-- Memory usage during calibration
+**Note**: Both models now use the same calibration settings (128 samples, batch 8, seqlen 256).
 
 ### Phase 2: Low-Rank QKV Decomposition
 
@@ -298,12 +289,12 @@ query_states = self.q_b_proj(query_states)
 
 | Aspect | Qwen2.5 | Qwen3 |
 |--------|---------|-------|
-| Calibration samples | 128 | 4 |
-| Batch size | 8 | 1 |
-| Max sequence length | 256 | 128 |
-| **Total tokens** | **~32,768** | **~512** |
-| **Memory usage** | Higher | Lower |
-| **Calibration time** | Longer | Shorter |
+| Calibration samples | 128 | 128 |
+| Batch size | 8 | 8 |
+| Max sequence length | 256 | 256 |
+| **Total tokens** | **~32,768** | **~32,768** |
+| **Memory usage** | Same | Same |
+| **Calibration time** | Same | Same |
 
 ### Model Size
 
@@ -328,9 +319,8 @@ For Qwen3-4B (hidden_size=3584, num_heads=32, head_dim=128, qk_mqa_dim=64):
 
 1. **Model Files**: Qwen2.5 uses Llama model files; Qwen3 has dedicated Qwen3 model files
 2. **Query LoRA**: Qwen2.5 has no query LoRA (`q-lora-rank=None`); Qwen3 uses query LoRA with rank 512
-3. **Calibration**: Qwen2.5 uses standard calibration (128 samples, batch 8); Qwen3 uses minimal calibration (4 samples, batch 1)
-4. **Device**: Qwen2.5 uses auto device; Qwen3 explicitly uses CPU
-5. **Evaluation**: Qwen2.5 evaluates perplexity; Qwen3 disables evaluation
+3. **Device**: Qwen2.5 uses auto device; Qwen3 explicitly uses CPU
+4. **Evaluation**: Qwen2.5 evaluates perplexity; Qwen3 disables evaluation
 
 ### Non-Critical Differences
 
@@ -343,18 +333,17 @@ For Qwen3-4B (hidden_size=3584, num_heads=32, head_dim=128, qk_mqa_dim=64):
 
 ### When to Use Qwen2.5 Approach
 
-- Standard conversion with full calibration
+- Standard conversion workflow
 - When query compression is not needed
 - When using GPU resources
 - When perplexity evaluation is desired
 
 ### When to Use Qwen3 Approach
 
-- Memory-constrained environments
-- Faster conversion needed
 - Query compression desired (reduced model size)
 - CPU-only environments
 - When evaluation is not needed
+- When dedicated Qwen3 model files are preferred
 
 ---
 
