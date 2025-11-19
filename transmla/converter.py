@@ -126,6 +126,7 @@ if __name__ == "__main__":
     parser.add_argument("--kv-lora-rank", type=int, default=512, help="")
     parser.add_argument("--balance-kv-ratio", type=float, default=1, help="")
     parser.add_argument("--use-qkv-norm", action='store_true', default=False, help="")
+    parser.add_argument("--use-original-norm-weights", action='store_true', default=False, help="Use original Qwen3 model's RMS norm weights instead of computing from calibration data")
     parser.add_argument("--deepseek-style", action='store_true', default=False, help="Use deepseek style modeling / configuration files from transformers.")
     args = parser.parse_args()
 

@@ -415,6 +415,18 @@ def low_rank_qkv(model, tokenizer, train_loader, test_loader, **kwargs):
     message = "Calibrating rope-removed model's qkv outputs"
     rm_rope_qkv_outputs = get_qkv_calibrate_outputs(model, train_loader, message)
 
+    # Store original norm weights before replacing attention modules
+    original_norm_weights = []
+    if kwargs.get("use_original_norm_weights", False) and kwargs.get("use_qkv_norm", False):
+        for layer_idx, layer in enumerate(model.model.layers):
+            original_self_attn = layer.self_attn
+            norm_weights = {}
+            if hasattr(original_self_attn, "q_norm") and hasattr(original_self_attn.q_norm, "weight"):
+                norm_weights["q_norm"] = original_self_attn.q_norm.weight.data.clone()
+            if hasattr(original_self_attn, "k_norm") and hasattr(original_self_attn.k_norm, "weight"):
+                norm_weights["k_norm"] = original_self_attn.k_norm.weight.data.clone()
+            original_norm_weights.append(norm_weights)
+
     for layer_idx, layer in enumerate(model.model.layers):
         setattr(layer, "self_attn", LoraQKV(
             layer.self_attn,
@@ -431,15 +443,26 @@ def low_rank_qkv(model, tokenizer, train_loader, test_loader, **kwargs):
         ))
     
     if kwargs["use_qkv_norm"]:
-        lora_qkv_outputs = get_qkv_calibrate_outputs(model, train_loader)
-        for layer_idx, layer in enumerate(model.model.layers):
-            # if len(lora_qkv_outputs["q_a_proj"]) > layer_idx 
-            # is used to check if q_a_proj exists for the current layer
-            statistics_qkv_rmsnorm(
-                layer.self_attn, 
-                lora_qkv_outputs["q_a_proj"][layer_idx] if len(lora_qkv_outputs["q_a_proj"]) > layer_idx else None, 
-                lora_qkv_outputs["kv_a_proj"][layer_idx]
-            )
+        if kwargs.get("use_original_norm_weights", False):
+            # Use original norm weights
+            for layer_idx, layer in enumerate(model.model.layers):
+                norm_weights = original_norm_weights[layer_idx] if layer_idx < len(original_norm_weights) else {}
+                use_original_norm_weights(
+                    layer.self_attn,
+                    norm_weights.get("q_norm"),
+                    norm_weights.get("k_norm")
+                )
+        else:
+            # Compute norm weights from calibration data
+            lora_qkv_outputs = get_qkv_calibrate_outputs(model, train_loader)
+            for layer_idx, layer in enumerate(model.model.layers):
+                # if len(lora_qkv_outputs["q_a_proj"]) > layer_idx 
+                # is used to check if q_a_proj exists for the current layer
+                statistics_qkv_rmsnorm(
+                    layer.self_attn, 
+                    lora_qkv_outputs["q_a_proj"][layer_idx] if len(lora_qkv_outputs["q_a_proj"]) > layer_idx else None, 
+                    lora_qkv_outputs["kv_a_proj"][layer_idx]
+                )
 
     if test_loader:
         message = "Evaluating lora-qkv model's ppl"

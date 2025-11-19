@@ -402,6 +402,37 @@ def pca_calc(X: list[torch.Tensor], device: str) -> torch.Tensor:
     eigen_vec = X_eig[1][:, index]
     return eigen_vec
 
+def use_original_norm_weights(self_attn, q_norm_weight, k_norm_weight):
+    """
+    Use original Qwen3 model's RMS norm weights instead of computing from calibration data.
+    
+    Since the original q_norm and k_norm have shape [head_dim] while q_a_layernorm and 
+    kv_a_layernorm have shapes [q_lora_rank] and [kv_lora_rank] respectively, we use the 
+    mean value of the original norm weights as a scalar and set all elements of the new 
+    norm weights to that value.
+    
+    Args:
+        self_attn: The attention module (LoraQKV instance) containing q_a_layernorm and
+                   kv_a_layernorm modules
+        q_norm_weight: Original q_norm.weight tensor from Qwen3 attention, shape [head_dim]
+        k_norm_weight: Original k_norm.weight tensor from Qwen3 attention, shape [head_dim]
+    """
+    if q_norm_weight is not None and hasattr(self_attn, "q_a_layernorm"):
+        # Use mean of original q_norm weights as scalar value
+        q_norm_scalar = q_norm_weight.mean().item()
+        self_attn.q_a_layernorm.weight.data.fill_(q_norm_scalar)
+        self_attn.q_a_layernorm.weight.data = self_attn.q_a_layernorm.weight.data.to(
+            self_attn.q_a_proj.weight.device
+        ).to(self_attn.dtype)
+    
+    if k_norm_weight is not None and hasattr(self_attn, "kv_a_layernorm"):
+        # Use mean of original k_norm weights as scalar value
+        k_norm_scalar = k_norm_weight.mean().item()
+        self_attn.kv_a_layernorm.weight.data.fill_(k_norm_scalar)
+        self_attn.kv_a_layernorm.weight.data = self_attn.kv_a_layernorm.weight.data.to(
+            self_attn.kv_a_proj_with_mqa.weight.device
+        ).to(self_attn.dtype)
+
 def statistics_qkv_rmsnorm(self_attn, q_a_outputs, kv_a_outputs):
     """
     Compute and set RMS normalization statistics for q_a_layernorm and kv_a_layernorm
