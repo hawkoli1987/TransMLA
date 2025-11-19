@@ -183,6 +183,39 @@ python3 transmla/converter.py \
 ### Step 1.5: Replace All Attention Layers
 Replaces each `layer.self_attn` with `PartialRope` instance across all transformer layers.
 
+#### Original Qwen3 Self-Attention Components (Pre-Phase 1)
+
+| Component | Weight Shape (Symbolic) | Weight Shape (Numeric) | Parameters |
+|-----------|------------------------|------------------------|------------|
+| `q_proj` | `[hidden_size, num_attention_heads × head_dim]` | `[3,584, 4,096]` | 14,680,064 |
+| `k_proj` | `[hidden_size, num_key_value_heads × head_dim]` | `[3,584, 1,024]` | 3,670,016 |
+| `v_proj` | `[hidden_size, num_key_value_heads × head_dim]` | `[3,584, 1,024]` | 3,670,016 |
+| `o_proj` | `[hidden_size, hidden_size]` | `[3,584, 3,584]` | 12,845,056 |
+| **Total** | | | **34,865,152** |
+
+#### New Qwen3 Self-Attention Components (Post-Phase 1)
+
+| Component | Weight Shape (Symbolic) | Weight Shape (Numeric) | Parameters |
+|-----------|------------------------|------------------------|------------|
+| `q_proj` | `[hidden_size, num_heads × head_dim]` | `[3,584, 4,096]` | 14,680,064 |
+| *`k_proj`| `[hidden_size, latent_dim]` | `[3,584, 1,024]` | 3,670,016 |
+| `v_proj` | `[hidden_size, latent_dim]` | `[3,584, 1,024]` | 3,670,016 |
+| `k_up_proj` | `[latent_dim, hidden_size]` | `[1,024, 3,584]` | 3,670,016 |
+| `v_up_proj` | `[latent_dim, hidden_size]` | `[1,024, 3,584]` | 3,670,016 |
+| `o_proj` | `[hidden_size, hidden_size]` | `[3,584, 3,584]` | 12,845,056 |
+| **Total** | | | **42,205,184** |
+
+#### Weight Preservation vs Modification After Phase 1
+
+**Code Reference**: `transmla/partial_rope.py` lines 64-72
+
+After Phase 1 transformation, the original projection layers are handled as follows:
+
+**Note**:
+- Only **`k_proj`** is modified: its weight tensor is rotated in-place using PCA to compress RoPE dimensions. The rotation preserves the mathematical equivalence while enabling partial RoPE application. i.e. `transmla/partial_rope.py` lines 108-127 (`rotate_k_proj()` method)
+- The **`k_up_proj`** and **`v_up_proj`** are newly created modules (not modifications of existing ones), initialized as identity matrices expanded to match the GQA structure.
+
+
 ### Step 1.6: Auto-search Optimal Freqfold (Optional)
 **Logic**: In `partial_rope()` function (lines 221-250)
 
@@ -296,6 +329,91 @@ Re-runs calibration on the PartialRope model to capture updated activations.
 
 ### Step 2.5: Replace All Attention Layers
 Replaces each `layer.self_attn` with `LoraQKV` instance across all transformer layers.
+
+#### PartialRope Components (Pre-Phase 2)
+
+Before Phase 2 transformation, each `self_attn` layer is a `PartialRope` module with the following components (from Phase 1):
+
+| Component | Weight Shape (Symbolic) | Weight Shape (Numeric) | Parameters |
+|-----------|------------------------|------------------------|------------|
+| `q_proj` | `[hidden_size, num_heads × head_dim]` | `[3,584, 4,096]` | 14,680,064 |
+| `k_proj` | `[hidden_size, latent_dim]` | `[3,584, 1,024]` | 3,670,016 |
+| `v_proj` | `[hidden_size, latent_dim]` | `[3,584, 1,024]` | 3,670,016 |
+| `k_up_proj` | `[latent_dim, hidden_size]` | `[1,024, 3,584]` | 3,670,016 |
+| `v_up_proj` | `[latent_dim, hidden_size]` | `[1,024, 3,584]` | 3,670,016 |
+| `o_proj` | `[hidden_size, hidden_size]` | `[3,584, 3,584]` | 12,845,056 |
+| **Total** | | | **42,205,184** |
+
+#### LoraQKV Components (Post-Phase 2)
+
+After Phase 2 transformation, each `self_attn` layer is a `LoraQKV` module with the following components:
+
+| Component | Weight Shape (Symbolic) | Weight Shape (Numeric) | Parameters |
+|-----------|------------------------|------------------------|------------|
+| `q_a_proj` | `[hidden_size, q_lora_rank]` | `[3,584, 512]` | 1,835,008 |
+| `q_b_proj` | `[q_lora_rank, num_heads × (qk_mqa_dim + head_dim)]` | `[512, 6,144]` | 3,145,728 |
+| `kv_a_proj_with_mqa` | `[hidden_size, kv_lora_rank + qk_mqa_dim]` | `[3,584, 576]` | 2,064,384 |
+| `kv_b_proj` | `[kv_lora_rank, num_heads × head_dim × 2]` | `[512, 8,192]` | 4,194,304 |
+| `o_proj` | `[hidden_size, hidden_size]` | `[3,584, 3,584]` | 12,845,056 |
+| **Total** | | | **24,084,480** |
+
+**Note**: For Qwen3-4B, `q_lora_rank=512` and `kv_lora_rank=512` are used. The `*` indicates components that are transformed from previous phase components.
+
+#### Weight Changes Phase 2
+
+**Phase 2 Transformation Overview**
+
+
+**1. Query Projection (`q_proj`) `[3,584, 4,096]` → Decomposed into `q_a_proj` `[3,584, 512]` + `q_b_proj` `[512, 6,144]`**
+  - **Step 1: Compute PCA matrix**
+    - Compute `R_q` from calibration query outputs
+  - **Step 2: Create `q_a_proj`**
+    - Use top `q_lora_rank=512` PCA components
+  - **Step 3: Create `q_b_proj`**
+    - Combine PCA basis vectors with absorbed `k_b_rope_weight` from `k_up_proj` via einsum
+  - **Step 4: Scale weights**
+    - Adjust from `sqrt(head_dim)` to `sqrt(head_dim + qk_mqa_dim)`
+
+**2. Key Projection (`k_proj`) `[3,584, 1,024]` → Absorbed into `kv_a_proj_with_mqa` `[3,584, 576]`**
+  - **Step 1: Split into two parts**
+    - Rope part: `k_a_rope_weight` (first `qk_mqa_dim=64` dimensions)
+    - Nope part: `k_a_nope_weight` (remaining 960 dimensions)
+  - **Step 2: Process nope part**
+    - Concatenate `k_a_nope_weight` with `v_proj` weights
+    - Decompose combined matrix using PCA matrix `R_kv`
+  - **Step 3: Build new projection**
+    - Preserve rope part (`k_a_rope_weight`)
+    - Concatenate preserved rope part with PCA-decomposed nope part
+
+**3. Value Projection (`v_proj`) `[3,584, 1,024]` → Absorbed into `kv_a_proj_with_mqa` `[3,584, 576]`**
+  - **Step 1: Concatenate with key nope part**
+    - Combine `v_proj` with `k_a_nope_weight` (from `k_proj`) to form combined weight matrix
+  - **Step 2: Decompose via PCA**
+    - Use `R_kv` computed from calibration key and value outputs
+  - **Step 3: Combine with rope part**
+    - Combine decomposed result with `k_a_rope_weight` to construct `kv_a_proj_with_mqa`
+
+**4. Key Upsampling Projection (`k_up_proj`) `[1,024, 3,584]` → Absorbed into `q_b_proj` `[512, 6,144]` and `kv_b_proj` `[512, 8,192]`**
+  - **Step 1: Split into two parts**
+    - Rope part: `k_b_rope_weight` (first `qk_mqa_dim=64` dimensions)
+    - Nope part: `k_b_nope_weight` (remaining 960 dimensions)
+  - **Step 2: Handle rope part**
+    - Absorbed into `q_b_proj` using einsum operation
+    - Contributes to query's RoPE component
+  - **Step 3: Handle nope part**
+    - Combined with `v_b_nope_weight` (from `v_up_proj`) in block-diagonal structure
+    - Decomposed via PCA to form `kv_b_proj`
+
+**5. Value Upsampling Projection (`v_up_proj`) `[1,024, 3,584]` → Absorbed into `kv_b_proj` `[512, 8,192]`**
+  - **Step 1: Combine with key nope part**
+    - Combine `v_up_proj` weights with `k_b_nope_weight` from `k_up_proj`
+  - **Step 2: Arrange in block-diagonal structure**
+    - Key and value sections arranged diagonally
+  - **Step 3: Decompose via PCA**
+    - Apply PCA decomposition using matrix `R_kv` to transform combined structure
+
+**6. Output Projection (`o_proj`) `[3,584, 3,584]` → Unchanged**
+
 
 ### Step 2.6: Calibrate for LayerNorm Statistics (Optional)
 If `use_qkv_norm == True`:

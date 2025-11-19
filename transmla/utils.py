@@ -403,6 +403,56 @@ def pca_calc(X: list[torch.Tensor], device: str) -> torch.Tensor:
     return eigen_vec
 
 def statistics_qkv_rmsnorm(self_attn, q_a_outputs, kv_a_outputs):
+    """
+    Compute and set RMS normalization statistics for q_a_layernorm and kv_a_layernorm
+    based on calibration outputs from q_a_proj and kv_a_proj_with_mqa.
+    
+    This function computes the RMS (Root Mean Square) normalization scale factor from
+    calibration data and sets the layernorm weights to a constant value based on this
+    statistic. This helps stabilize training by normalizing activations.
+    
+    Args:
+        self_attn: The attention module (LoraQKV instance) containing q_a_layernorm and
+                   kv_a_layernorm modules
+        q_a_outputs: List of tensors from q_a_proj calibration outputs, or None if
+                     q_a_proj doesn't exist (when q_lora_rank is None)
+        kv_a_outputs: List of tensors from kv_a_proj_with_mqa calibration outputs
+    
+    Concrete Example (Qwen3-4B):
+        Input shapes:
+        - q_a_outputs: List of [batch_size, seq_len, q_hidden_dim] tensors from q_a_proj
+          Example: [tensor([4, 128, 512]), 
+                    tensor([4, 128, 512]), 
+                    ...]
+        - kv_a_outputs: List of [batch_size, seq_len, kv_hidden_dim] tensors from kv_a_proj_with_mqa
+          Example: [tensor([4, 128, 576]), 
+                    tensor([4, 128, 576]), 
+                    ...]
+        
+        Process for q_a_layernorm (if q_a_outputs is not None):
+        1. Concatenate all batches: torch.cat(q_a_outputs)
+           Result: [total_tokens, q_hidden_dim] 
+           where total_tokens = n_batches * batch_size * seq_len)
+           Example: total_tokens = 2 * 4 * 128 = 1024
+        
+        2. Compute RMS: rsqrt(mean(x^2) + eps)
+           - q_a_proj.pow(2): [1024, 512] → element-wise square
+           - .mean(-1): [1024, 512] → [1024] (mean over last dim, per token)
+           - + eps: [1024] → [1024] (add epsilon, e.g., 1e-6)
+           - rsqrt: [1024] → [1024] (1/sqrt, per token)
+           - .mean(): [1024] → scalar (mean over all tokens)
+           Example result: scalar value like 0.95
+        
+        3. Set layernorm weight: full_like(weight.shape, computed_value)
+           - q_a_layernorm.weight: [512] → all elements set to computed scalar
+           Example: [512] filled with 0.95
+        
+        Process for kv_a_layernorm (always executed):
+        Same as above but with kv_a_outputs:
+        - Concatenate: [total_tokens, 576]
+        - Compute RMS: scalar value
+        - Set kv_a_layernorm.weight: [576] filled with computed scalar
+    """
     if q_a_outputs is not None:
         self_attn.q_a_layernorm.weight.data.to(self_attn.q_a_proj.weight.device).to(self_attn.dtype)
         q_a_proj = torch.cat(q_a_outputs)

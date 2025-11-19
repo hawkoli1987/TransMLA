@@ -148,25 +148,50 @@ class LoraQKV(nn.Module):
 
         # 1. Initialize q_a_proj / q_b_proj if q_lora_rank is not None (revised by xiaojuan based on bias...)
         # 1.1 Initialize q_a_proj
+        # Compute scaling factor to adjust attention scaling from 1/√head_dim to 1/√(head_dim + qk_mqa_dim)
+        # For Qwen3-4B: original_scaling = 1/√128 ≈ 0.0884, self.scaling = 1/√192 ≈ 0.0722
+        # Result: scaling ≈ 1.2247
         original_scaling = getattr(self.config, "query_pre_attn_scalar", self.head_dim)**-0.5
         scaling = original_scaling / self.scaling
         if self.q_lora_rank is not None:
+            # Get original q_proj weight: [3,584, 4,096] for Qwen3-4B
             q_weight = self_attn.q_proj.weight.data.to(torch.float64)
 
+            # Create q_a_proj weight via PCA projection
+            # R_q shape: [4,096, 4,096] (PCA matrix from calibration)
+            # R_q.T @ q_weight: [4,096, 3,584] (matrix multiplication)
+            # [:q_lora_rank] takes first 512 rows: [512, 3,584]
+            # Final q_a_proj.weight: [512, 3,584] (Linear(3584, 512))
             q_a_weight = (R_q.T @ q_weight)[: self.q_lora_rank].to(self.dtype)
             self.q_a_proj.weight.data = q_a_weight.contiguous()
             
+            # Extract PCA basis vectors for q_b_proj
+            # R_q[:, :q_lora_rank] extracts first 512 columns: [4,096, 512]
+            # These are the top 512 PCA basis vectors
             q_b_weight = R_q[:, :self.q_lora_rank].to(self.dtype)
+            # Reshape to per-head format: [4,096, 512] → [32, 128, 512] for Qwen3-4B
+            # This reshapes: 32 heads × 128 head_dim × 512 PCA dimensions
             q_b_weight = q_b_weight.view(self.num_attention_heads, self.head_dim, self.q_lora_rank)
-            # Absorb the rope part of k_b_proj into q_b_proj
+            # Absorb the rope part of k_b_proj into q_b_proj via einsum
+            # q_b_weight: [32, 128, 512] (h=32 heads, d=128 head_dim, q=512 PCA dims)
+            # k_b_rope_weight: [32, 128, 64] (from k_up_proj, h=32, d=128, k=64 rope dims)
+            # einsum "hdq,hdk->hkq": contract over d (head_dim)
+            # Result: [32, 64, 512] (h=32, k=64 rope dims, q=512 PCA dims)
             q_b_rope_weight = torch.einsum("hdq,hdk->hkq", q_b_weight, k_b_rope_weight)
+            # Concatenate nope and rope parts, then reshape
+            # q_b_weight: [32, 128, 512] (nope part)
+            # q_b_rope_weight: [32, 64, 512] (rope part)
+            # Concat along dim=1: [32, 192, 512] (128 + 64 = 192)
+            # Reshape: [32 * 192, 512] = [6,144, 512] for Qwen3-4B
             q_b_with_mqa_weight = torch.cat([q_b_weight, q_b_rope_weight], dim=1).reshape(
                 self.num_attention_heads * (self.head_dim + self.qk_mqa_dim), self.q_lora_rank
             )
 
-            # Scale the weight before initializing the q_b_projAdd commentMore actions
+            # Scale the weight before initializing the q_b_proj
             # In the original GQA, attention scores are divided by sqrt(head_dim).
             # However, in the transformed MLA, the attention scores are divided by sqrt(head_dim + qk_mqa_dim).
+            # Apply scaling factor (≈1.2247) to adjust for the new attention scaling
+            # Final q_b_proj.weight: [6,144, 512] (Linear(512, 6144) where 6144 = 32 heads × (128 + 64))
             self.q_b_proj.weight.data = q_b_with_mqa_weight.contiguous() * scaling
 
         else:
@@ -190,10 +215,25 @@ class LoraQKV(nn.Module):
         
         # 2. Low-rank decomposing k_proj and v_proj
         # 2.1 Concatenate the nope parts of k_proj and v_proj
+        # For Qwen3-4B:
+        # k_a_nope_weight: [960, 3,584] (from k_proj split, latent_dim - qk_mqa_dim = 1024 - 64 = 960)
+        # v_a_nope_weight: [1,024, 3,584] (v_proj.weight.data)
+        # Concatenate along dim=0: [1,984, 3,584] (960 + 1024 = 1984)
         kv_a_nope_weight = torch.cat([k_a_nope_weight, v_a_nope_weight], dim=0).to(torch.float64)
         if self.attention_bias:
+            # Concatenate biases: k_bias_nope [960] + v_bias [1,024] = [1,984]
+            # Unsqueeze to add dimension: [1,984, 1]
+            # Concatenate with weight along dim=-1: [1,984, 3,585] (3584 + 1 = 3585)
             kv_a_nope_bias = torch.cat([k_bias_nope, v_bias]).unsqueeze(-1).to(torch.float64)
             kv_a_nope_weight = torch.cat([kv_a_nope_weight, kv_a_nope_bias], dim=-1)
+        # Create block-diagonal structure for kv_b_nope_weight
+        # For Qwen3-4B:
+        # k_b_nope_weight: [32, 128, 960] (from k_up_proj, reshaped to per-head format)
+        # v_b_nope_weight: [32, 128, 1,024] (from v_up_proj, reshaped to per-head format)
+        # First inner concat: [k_b_nope_weight, zeros] → [32, 128, 1,984] (960 + 1024 = 1984)
+        # Second inner concat: [zeros, v_b_nope_weight] → [32, 128, 1,984]
+        # Outer concat along dim=1: [64, 128, 1,984] (32 + 32 = 64 heads)
+        # Reshape: [8,192, 1,984] (64 * 128 = 8192, 2 * 1024 - 64 = 1984)
         kv_b_nope_weight = torch.cat(
             [
                 torch.cat([k_b_nope_weight, torch.zeros_like(v_b_nope_weight)], dim=-1),
@@ -204,15 +244,41 @@ class LoraQKV(nn.Module):
         
 
         # 2.2 Low-rank decomposing kv_a_nope_weight and kv_b_nope_weight
+        # Apply PCA to kv_a_nope_weight
+        # For Qwen3-4B:
+        # R_kv shape: [1,984, 1,984] (PCA matrix from calibration)
+        # kv_a_nope_weight: [1,984, 3,584] (or [1,984, 3,585] if bias was included)
+        # R_kv.T @ kv_a_nope_weight: [1,984, 3,584] (matrix multiplication)
+        # [:kv_lora_rank] takes first 512 rows: [512, 3,584]
+        # Final kv_a_nope_weight: [512, 3,584] (or [512, 3,585] if bias)
         kv_a_nope_weight = (R_kv.T @ kv_a_nope_weight)[: self.kv_lora_rank].to(self.dtype)
         if self.attention_bias:
+            # Split weight and bias if bias was included in the PCA input
+            # kv_a_nope_weight: [512, 3,585] (includes bias column)
+            # Split: [512, 3,584] (weight) and [512, 1] (bias)
+            # Flatten bias: [512]
             kv_a_nope_weight, kv_a_nope_bias = torch.split(kv_a_nope_weight, [self.hidden_size, 1], dim=-1)
             kv_a_nope_bias = kv_a_nope_bias.flatten().to(self.dtype)
+        # Apply PCA to kv_b_nope_weight
+        # For Qwen3-4B:
+        # kv_b_nope_weight: [8,192, 1,984] (block-diagonal structure from previous step)
+        # R_kv: [1,984, 1,984] (PCA matrix from calibration)
+        # kv_b_nope_weight @ R_kv: [8,192, 1,984] (matrix multiplication)
+        # [:, :kv_lora_rank] takes first 512 columns: [8,192, 512]
+        # Final kv_b_nope_weight: [8,192, 512]
         kv_b_nope_weight = (kv_b_nope_weight @ R_kv)[:, :self.kv_lora_rank].to(self.dtype)
+        # Store in kv_b_proj.weight: [8,192, 512] (Linear(512, 8192) where 8192 = 32 heads × 128 head_dim × 2)
         self.kv_b_proj.weight.data = kv_b_nope_weight.contiguous()
+        # Concatenate kv_a_nope_weight with k_a_rope_weight to form kv_a_proj_with_mqa
+        # For Qwen3-4B:
+        # kv_a_nope_weight: [512, 3,584] (PCA output)
+        # k_a_rope_weight: [64, 3,584] (from k_proj split, rope part)
+        # Concatenate along dim=0: [576, 3,584] (512 + 64 = 576)
+        # Final kv_a_proj_with_mqa.weight: [576, 3,584] (Linear(3584, 576))
         kv_a_proj_with_mqa_weight = torch.cat([kv_a_nope_weight, k_a_rope_weight], dim=0)
         self.kv_a_proj_with_mqa.weight.data = kv_a_proj_with_mqa_weight.contiguous()
         if self.attention_bias:
+            # Concatenate biases: kv_a_nope_bias [512] + k_bias_rope [64] = [576]
             kv_a_proj_with_mqa_bias = torch.cat([kv_a_nope_bias, k_bias_rope])
             self.kv_a_proj_with_mqa.bias.data = kv_a_proj_with_mqa_bias.contiguous()
 
@@ -298,6 +364,8 @@ def low_rank_qkv(model, tokenizer, train_loader, test_loader, **kwargs):
     if kwargs["use_qkv_norm"]:
         lora_qkv_outputs = get_qkv_calibrate_outputs(model, train_loader)
         for layer_idx, layer in enumerate(model.model.layers):
+            # if len(lora_qkv_outputs["q_a_proj"]) > layer_idx 
+            # is used to check if q_a_proj exists for the current layer
             statistics_qkv_rmsnorm(
                 layer.self_attn, 
                 lora_qkv_outputs["q_a_proj"][layer_idx] if len(lora_qkv_outputs["q_a_proj"]) > layer_idx else None, 
