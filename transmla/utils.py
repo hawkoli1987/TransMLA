@@ -161,10 +161,10 @@ def prepare_dataloader(
         ds = datasets.Dataset.from_dict({data_name: new_data_list})
 
     def tokenize(data_batch):
-        # tokenize then pad each batch according to the longest sequence in the batch
+        # tokenize then pad all sequences to max_seqlen to ensure consistent batch sizes
         batch = tokenizer(
             data_batch[data_name],
-            padding="longest",
+            padding="max_length",
             max_length=max_seqlen,
             truncation=True,
             return_tensors="pt",
