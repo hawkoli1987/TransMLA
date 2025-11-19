@@ -200,8 +200,8 @@ Replaces each `layer.self_attn` with `PartialRope` instance across all transform
 | `q_proj` | `[hidden_size, num_heads × head_dim]` | `[3,584, 4,096]` | 14,680,064 |
 | *`k_proj`| `[hidden_size, latent_dim]` | `[3,584, 1,024]` | 3,670,016 |
 | `v_proj` | `[hidden_size, latent_dim]` | `[3,584, 1,024]` | 3,670,016 |
-| `k_up_proj` | `[latent_dim, hidden_size]` | `[1,024, 3,584]` | 3,670,016 |
-| `v_up_proj` | `[latent_dim, hidden_size]` | `[1,024, 3,584]` | 3,670,016 |
+| *`k_up_proj` | `[latent_dim, hidden_size]` | `[1,024, 3,584]` | 3,670,016 |
+| *`v_up_proj` | `[latent_dim, hidden_size]` | `[1,024, 3,584]` | 3,670,016 |
 | `o_proj` | `[hidden_size, hidden_size]` | `[3,584, 3,584]` | 12,845,056 |
 | **Total** | | | **42,205,184** |
 

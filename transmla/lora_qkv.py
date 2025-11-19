@@ -5,7 +5,7 @@ from typing import Optional, Tuple
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.models.deepseek_v3.modeling_deepseek_v3 import apply_rotary_pos_emb_interleave
 
-from utils import pca_calc, get_qkv_calibrate_outputs, evaluate_ppl, statistics_qkv_rmsnorm
+from utils import pca_calc, get_qkv_calibrate_outputs, evaluate_ppl, statistics_qkv_rmsnorm, use_original_norm_weights
 
  
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -294,6 +294,75 @@ class LoraQKV(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        """
+        Forward pass of the LoraQKV attention module implementing Multi-head Latent Attention (MLA).
+        
+        Processes hidden states through low-rank query/key/value projections with RMSNorm,
+        applies Rotary Position Embedding (RoPE) to the RoPE parts, and computes attention.
+        Assumes q_lora_rank is always used and qkv_norm is always enabled.
+        
+        Args:
+            hidden_states: Input tensor [batch_size, seq_len, hidden_size]
+            attention_mask: Optional attention mask tensor
+            position_ids: Optional position IDs (deprecated)
+            past_key_value: Optional cached key-value states
+            output_attentions: Whether to return attention weights
+            use_cache: Whether to use cached key-value states
+            cache_position: Optional cache position tensor
+            position_embeddings: Tuple of (cos, sin) tensors for RoPE [batch, 1, seq_len, head_dim]
+        
+        Returns:
+            Tuple of (attn_output, attn_weights, past_key_value)
+            - attn_output: [batch_size, seq_len, hidden_size]
+            - attn_weights: Optional attention weights
+            - past_key_value: Optional cached states
+        
+        Processing Steps:
+        
+        1. **Query Projection**:
+           - q_a_proj: [B, L, H] → [B, L, q_lora_rank]
+           - q_a_layernorm: Apply RMSNorm
+           - q_b_proj: [B, L, q_lora_rank] → [B, L, num_heads * (head_dim + qk_mqa_dim)]
+        
+        2. **Query Reshape and Split**:
+           - Reshape: [B, L, num_heads * (head_dim + qk_mqa_dim)] → [B, num_heads, L, head_dim + qk_mqa_dim]
+           - Split: 
+            - q_nope [B, num_heads, L, head_dim], 
+            - q_rope [B, num_heads, L, qk_mqa_dim] (qk_mqa_dim = qk_rope_hidden_dim)
+        
+        3. **Key/Value Compression**:
+           - kv_a_proj_with_mqa: [B, L, H]
+           - Split: kv_nope [B, L, kv_lora_rank], k_rope [B, L, qk_mqa_dim]
+           - Reshape: kv_nope [B, 1, L, kv_lora_rank], k_rope [B, 1, L, qk_mqa_dim]
+        
+        4. **Rotary Position Embedding**:
+           - Apply RoPE to q_rope and k_rope using interleaved format with collapsed frequency
+        
+        5. **Query Reconstruction**:
+           - Concatenate q_nope and q_rope along hidden_dim
+           - Final shape: [B, num_heads, L, head_dim + qk_mqa_dim]
+        
+        6. **Key/Value Expansion**:
+           - kv_a_layernorm: Apply RMSNorm to kv_nope [B, 1, L, kv_lora_rank]
+           - kv_b_proj: [B, 1, L, kv_lora_rank] → [B, 1, L, num_heads * head_dim * 2]
+           - Reshape and transpose: [B, num_heads, L, head_dim * 2]
+           - Split the hidden_dim into key nope and value parts:
+             * k_nope: [B, num_heads, L, head_dim]
+             * v: [B, num_heads, L, head_dim]
+           - Duplicates k_rope for all attention heads:
+             * B, 1, L, qk_mqa_dim] → [B, num_heads, L, qk_mqa_dim]
+           - Concatenate k_nope and expanded k_rope along hidden_dim:
+             * key_states = concat([k_nope, expanded_k_rope], dim=-1)
+             * Final shape: [B, num_heads, L, head_dim + qk_mqa_dim]
+        
+        7. **Attention Computation**:
+           - Compute scores: Q @ K^T / sqrt(head_dim + qk_mqa_dim)
+           - Apply mask, softmax, and weighted sum: attention_weights @ V
+        
+        8. **Output Projection**:
+           - Reshape: [B, num_heads, L, head_dim] → [B, L, num_heads * head_dim]
+           - o_proj: [B, L, num_heads * head_dim] → [B, L, hidden_size]
+        """
         bsz, q_len, _ = hidden_states.size()
 
         # query

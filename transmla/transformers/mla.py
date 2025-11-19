@@ -89,6 +89,7 @@ class MLAAttention(nn.Module):
         if self.q_lora_rank is None:
             q_states = self.q_proj(hidden_states)
         elif self.qk_latent_layernorm:
+            # This is the path taken for Qwen3-4B
             q_states = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
         else:
             q_states = self.q_b_proj(self.q_a_proj(hidden_states))
