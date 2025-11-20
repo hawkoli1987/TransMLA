@@ -502,8 +502,9 @@ def extract_qk_from_model(model: torch.nn.Module, hidden_states: torch.Tensor, l
     
     Handles different model types:
     - Original Qwen3: standard q_proj and k_proj
-    - PartialRope: q_proj and k_proj with k_up_proj
-    - LoraQKV: q_a_proj/q_b_proj and kv_a_proj_with_mqa/kv_b_proj structure
+    - PartialRope: q_proj and k_proj with k_up_proj (Phase 1)
+    - LoraQKV: q_a_proj/q_b_proj and kv_a_proj_with_mqa/kv_b_proj structure (Phase 2)
+    - MLAAttention: Final converted model structure with qk_nope_head_dim and qk_rope_head_dim
     
     Args:
         model: The model to extract Q and K from
@@ -514,6 +515,7 @@ def extract_qk_from_model(model: torch.nn.Module, hidden_states: torch.Tensor, l
     
     Returns:
         Tuple of (Q, K) tensors in shape [batch, num_heads, seq_len, head_dim]
+        For comparison, all structures are normalized to use head_dim (or qk_nope_dim for MLAAttention)
     """
     layer = model.model.layers[layer_idx]
     self_attn = layer.self_attn
@@ -524,53 +526,104 @@ def extract_qk_from_model(model: torch.nn.Module, hidden_states: torch.Tensor, l
     
     # Handle different attention structures
     if hasattr(self_attn, 'q_a_proj') and hasattr(self_attn, 'kv_a_proj_with_mqa'):
-        # LoraQKV structure
+        # LoraQKV or MLAAttention structure
         bsz, q_len, _ = hidden_states.size()
         
-        # Query: q_a_proj -> q_a_layernorm -> q_b_proj
-        if hasattr(self_attn, 'q_a_proj'):
-            q_a = self_attn.q_a_proj(hidden_states)
-            if hasattr(self_attn, 'q_a_layernorm'):
-                q_a = self_attn.q_a_layernorm(q_a)
-            q = self_attn.q_b_proj(q_a)  # [batch, seq_len, num_heads * (head_dim + qk_mqa_dim)]
+        # Check if it's MLAAttention (has qk_nope_head_dim, qk_rope_head_dim) or LoraQKV (has qk_mqa_dim)
+        if hasattr(self_attn, 'qk_nope_head_dim') and hasattr(self_attn, 'qk_rope_head_dim'):
+            # MLAAttention structure (final converted model)
+            qk_nope_dim = self_attn.qk_nope_head_dim
+            qk_rope_dim = self_attn.qk_rope_head_dim
+            qk_head_dim = self_attn.qk_head_dim  # qk_nope_dim + qk_rope_dim
+            kv_lora_rank = self_attn.kv_lora_rank
+            
+            # Query: q_a_proj -> q_a_layernorm -> q_b_proj
+            if hasattr(self_attn, 'q_lora_rank') and self_attn.q_lora_rank is not None:
+                if hasattr(self_attn, 'qk_latent_layernorm') and self_attn.qk_latent_layernorm:
+                    q_states = self_attn.q_b_proj(self_attn.q_a_layernorm(self_attn.q_a_proj(hidden_states)))
+                else:
+                    q_states = self_attn.q_b_proj(self_attn.q_a_proj(hidden_states))
+            else:
+                q_states = self_attn.q_proj(hidden_states)
+            
+            q_states = q_states.view(bsz, q_len, num_heads, qk_head_dim).transpose(1, 2)
+            q_nope, q_rope = q_states.split([qk_nope_dim, qk_rope_dim], dim=-1)
+            
+            # Key: kv_a_proj_with_mqa -> split -> kv_b_proj
+            compressed_kv = self_attn.kv_a_proj_with_mqa(hidden_states)
+            k_pass, k_rot = compressed_kv.split([kv_lora_rank, qk_rope_dim], dim=-1)
+            k_pass = k_pass.view(bsz, 1, q_len, kv_lora_rank)
+            
+            if hasattr(self_attn, 'qk_latent_layernorm') and self_attn.qk_latent_layernorm:
+                k_pass = self_attn.kv_b_proj(self_attn.kv_a_layernorm(k_pass))
+            else:
+                k_pass = self_attn.kv_b_proj(k_pass)
+            
+            k_pass = k_pass.view(bsz, q_len, num_heads, qk_nope_dim + self_attn.v_head_dim).transpose(1, 2)
+            k_nope, _ = k_pass.split([qk_nope_dim, self_attn.v_head_dim], dim=-1)
+            k_rot = k_rot.view(bsz, 1, q_len, qk_rope_dim)
+            
+            # Apply RoPE if position_embeddings provided
+            if position_embeddings is not None:
+                from transformers.models.deepseek_v3.modeling_deepseek_v3 import apply_rotary_pos_emb_interleave
+                cos, sin = position_embeddings
+                q_rope, k_rot = apply_rotary_pos_emb_interleave(q_rope, k_rot, cos, sin)
+                k_rot = k_rot.expand(*k_nope.shape[:-1], -1)  # Expand to match k_nope shape
+            
+            # Concatenate nope and rope parts
+            q = torch.cat([q_nope, q_rope], dim=-1)  # [batch, num_heads, seq_len, qk_head_dim]
+            k = torch.cat([k_nope, k_rot], dim=-1)  # [batch, num_heads, seq_len, qk_head_dim]
+            
+            # Use only qk_nope_dim for comparison with original model (to match head_dim)
+            q = q[..., :qk_nope_dim]
+            k = k[..., :qk_nope_dim]
+            
         else:
-            q = self_attn.q_proj(hidden_states)
-        
-        q = q.view(bsz, q_len, num_heads, -1).transpose(1, 2)  # [batch, num_heads, seq_len, head_dim + qk_mqa_dim]
-        qk_mqa_dim = getattr(self_attn, 'qk_mqa_dim', q.size(-1) - head_dim)
-        q_nope, q_rope = q.split([head_dim, qk_mqa_dim], dim=-1)
-        
-        # Key: kv_a_proj_with_mqa -> split -> kv_b_proj
-        compressed_kv = self_attn.kv_a_proj_with_mqa(hidden_states)  # [batch, seq_len, kv_lora_rank + qk_mqa_dim]
-        kv_lora_rank = getattr(self_attn, 'kv_lora_rank', compressed_kv.size(-1) - qk_mqa_dim)
-        kv_nope, k_rope = compressed_kv.split([kv_lora_rank, qk_mqa_dim], dim=-1)
-        kv_nope = kv_nope.view(bsz, 1, q_len, kv_lora_rank)
-        
-        if hasattr(self_attn, 'kv_a_layernorm'):
-            kv_nope = self_attn.kv_a_layernorm(kv_nope)
-        kv_expanded = self_attn.kv_b_proj(kv_nope)  # [batch, 1, seq_len, num_heads * head_dim * 2]
-        kv_expanded = kv_expanded.view(bsz, q_len, num_heads, head_dim * 2).transpose(1, 2)
-        k_nope, _ = kv_expanded.split([head_dim, head_dim], dim=-1)
-        k_rope = k_rope.view(bsz, 1, q_len, qk_mqa_dim)
-        
-        # Apply RoPE if position_embeddings provided
-        if position_embeddings is not None:
-            from transformers.models.deepseek_v3.modeling_deepseek_v3 import apply_rotary_pos_emb_interleave
-            cos, sin = position_embeddings
-            collapse = getattr(self_attn, 'collapse', 1)
-            q_rope, k_rope = apply_rotary_pos_emb_interleave(
-                q_rope, k_rope, cos[:, :, ::collapse], sin[:, :, ::collapse]
-            )
-            # Expand k_rope to all heads
-            k_rope = k_rope.expand(bsz, num_heads, q_len, qk_mqa_dim)
-        
-        # Concatenate nope and rope parts
-        q = torch.cat([q_nope, q_rope], dim=-1)  # [batch, num_heads, seq_len, head_dim + qk_mqa_dim]
-        k = torch.cat([k_nope, k_rope], dim=-1)  # [batch, num_heads, seq_len, head_dim + qk_mqa_dim]
-        
-        # Use only head_dim for comparison with original model
-        q = q[..., :head_dim]
-        k = k[..., :head_dim]
+            # LoraQKV structure (intermediate conversion step)
+            # Query: q_a_proj -> q_a_layernorm -> q_b_proj
+            if hasattr(self_attn, 'q_a_proj'):
+                q_a = self_attn.q_a_proj(hidden_states)
+                if hasattr(self_attn, 'q_a_layernorm'):
+                    q_a = self_attn.q_a_layernorm(q_a)
+                q = self_attn.q_b_proj(q_a)  # [batch, seq_len, num_heads * (head_dim + qk_mqa_dim)]
+            else:
+                q = self_attn.q_proj(hidden_states)
+            
+            q = q.view(bsz, q_len, num_heads, -1).transpose(1, 2)  # [batch, num_heads, seq_len, head_dim + qk_mqa_dim]
+            qk_mqa_dim = getattr(self_attn, 'qk_mqa_dim', q.size(-1) - head_dim)
+            q_nope, q_rope = q.split([head_dim, qk_mqa_dim], dim=-1)
+            
+            # Key: kv_a_proj_with_mqa -> split -> kv_b_proj
+            compressed_kv = self_attn.kv_a_proj_with_mqa(hidden_states)  # [batch, seq_len, kv_lora_rank + qk_mqa_dim]
+            kv_lora_rank = getattr(self_attn, 'kv_lora_rank', compressed_kv.size(-1) - qk_mqa_dim)
+            kv_nope, k_rope = compressed_kv.split([kv_lora_rank, qk_mqa_dim], dim=-1)
+            kv_nope = kv_nope.view(bsz, 1, q_len, kv_lora_rank)
+            
+            if hasattr(self_attn, 'kv_a_layernorm'):
+                kv_nope = self_attn.kv_a_layernorm(kv_nope)
+            kv_expanded = self_attn.kv_b_proj(kv_nope)  # [batch, 1, seq_len, num_heads * head_dim * 2]
+            kv_expanded = kv_expanded.view(bsz, q_len, num_heads, head_dim * 2).transpose(1, 2)
+            k_nope, _ = kv_expanded.split([head_dim, head_dim], dim=-1)
+            k_rope = k_rope.view(bsz, 1, q_len, qk_mqa_dim)
+            
+            # Apply RoPE if position_embeddings provided
+            if position_embeddings is not None:
+                from transformers.models.deepseek_v3.modeling_deepseek_v3 import apply_rotary_pos_emb_interleave
+                cos, sin = position_embeddings
+                collapse = getattr(self_attn, 'collapse', 1)
+                q_rope, k_rope = apply_rotary_pos_emb_interleave(
+                    q_rope, k_rope, cos[:, :, ::collapse], sin[:, :, ::collapse]
+                )
+                # Expand k_rope to all heads
+                k_rope = k_rope.expand(bsz, num_heads, q_len, qk_mqa_dim)
+            
+            # Concatenate nope and rope parts
+            q = torch.cat([q_nope, q_rope], dim=-1)  # [batch, num_heads, seq_len, head_dim + qk_mqa_dim]
+            k = torch.cat([k_nope, k_rope], dim=-1)  # [batch, num_heads, seq_len, head_dim + qk_mqa_dim]
+            
+            # Use only head_dim for comparison with original model
+            q = q[..., :head_dim]
+            k = k[..., :head_dim]
         
     elif hasattr(self_attn, 'k_up_proj'):
         # PartialRope structure
