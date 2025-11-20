@@ -543,6 +543,8 @@ def extract_qk_from_model(model: torch.nn.Module, hidden_states: torch.Tensor, l
         # PartialRope structure
         # In PartialRope, Q and K are transformed to latent_dim space, but for comparison
         # with original model (head_dim), we expand both back to head_dim
+        # k_up_proj is Linear(latent_dim, hidden_size) where hidden_size = num_heads * head_dim
+        # Weight shape: [hidden_size, latent_dim] = [num_heads * head_dim, latent_dim]
         k_up_weight = self_attn.k_up_proj.weight.view(num_heads, head_dim, self_attn.latent_dim)
         k_up_weight_T = k_up_weight.transpose(-2, -1)  # [num_heads, latent_dim, head_dim] for inverse transform
         
@@ -554,9 +556,17 @@ def extract_qk_from_model(model: torch.nn.Module, hidden_states: torch.Tensor, l
         # Q is already in correct shape [batch, num_heads, seq_len, head_dim]
         
         # K: k_proj -> reshape -> expand to head_dim
+        # k_proj outputs [batch, seq_len, latent_dim]
         k_latent = self_attn.k_proj(hidden_states)  # [batch, seq_len, latent_dim]
-        k_latent = k_latent.view(-1, 1, k_latent.size(1), self_attn.latent_dim)  # [batch, 1, seq_len, latent_dim]
-        k = torch.einsum("b1td,hdc->bhtd", k_latent, k_up_weight)  # [batch, num_heads, seq_len, head_dim]
+        batch_size, seq_len = k_latent.shape[:2]
+        k_latent = k_latent.view(batch_size, 1, seq_len, self_attn.latent_dim)  # [batch, 1, seq_len, latent_dim]
+        # Expand k_latent to [batch, num_heads, seq_len, head_dim] using k_up_weight
+        # k_up_weight: [num_heads, head_dim, latent_dim]
+        # k_latent: [batch, 1, seq_len, latent_dim]
+        # Output: [batch, num_heads, seq_len, head_dim]
+        # Expand the dimension of size 1 to num_heads, then contract latent_dim
+        k_latent = k_latent.expand(batch_size, num_heads, seq_len, self_attn.latent_dim)  # [batch, num_heads, seq_len, latent_dim]
+        k = torch.einsum("bhtl,hdl->bhtd", k_latent, k_up_weight)  # [batch, num_heads, seq_len, head_dim]
         
     else:
         # Standard structure (original Qwen3)
@@ -601,6 +611,10 @@ def calculate_qk_dot_product_kl_divergence(
     original_model.eval()
     converted_model.eval()
     
+    # Ensure both models are on the same device (use converted_model's device)
+    target_device = next(converted_model.parameters()).device
+    original_model = original_model.to(target_device)
+    
     # Storage for QK dot products per layer
     original_qk_dot_products = {}
     converted_qk_dot_products = {}
@@ -610,7 +624,7 @@ def calculate_qk_dot_product_kl_divergence(
         if batch_idx >= 1:  # Only use first batch for efficiency
             break
             
-        batch = map_tensors(batch, original_model.model.embed_tokens.weight.device)
+        batch = map_tensors(batch, target_device)
         input_ids = batch["input_ids"]
         attention_mask = batch.get("attention_mask")
         
