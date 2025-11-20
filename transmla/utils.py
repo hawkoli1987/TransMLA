@@ -247,57 +247,156 @@ class _ScaledDotProductAttentionCapture:
 
 class QKDotProductMonitor:
     """
-    Collects sampled QK dot products across attention calls to approximate their distribution.
+    Collects QK dot products per sequence, with K averaged over head dimension.
+    Stores complete dot product matrices per sequence (no sampling within sequence).
+    Can save to disk to avoid OOM.
     """
 
-    def __init__(self, label: str = "", samples_per_call: int = 2048):
+    def __init__(self, label: str = "", samples_per_call: int = 2048, save_dir: str | None = None, max_sequences: int = 10):
         self.label = label
-        self.samples_per_call = samples_per_call
-        self._samples: list[torch.Tensor] = []
+        self.samples_per_call = samples_per_call  # Not used for within-sequence sampling, kept for compatibility
+        self.save_dir = save_dir  # Directory to save dot products to disk
+        self.max_sequences = max_sequences  # Only process first N sequences
+        # Store per-sequence: _samples[sequence_idx] = list of tensors from that sequence
+        self._samples: list[list[torch.Tensor]] = []
+        self._current_batch_start_idx = 0  # Starting index for current batch
+        self._sequence_count = 0  # Total sequences processed so far
 
     def reset(self):
         self._samples.clear()
+        self._current_batch_start_idx = 0
+        self._sequence_count = 0
+
+    def start_batch(self, batch_size: int):
+        """Call at the start of each new batch to track sequences separately."""
+        # Only process if we haven't reached max_sequences
+        remaining_slots = max(0, self.max_sequences - self._sequence_count)
+        if remaining_slots == 0:
+            return  # Skip this batch if we already have enough sequences
+        
+        # Reserve slots for sequences in this batch (up to max_sequences)
+        self._current_batch_start_idx = len(self._samples)
+        actual_batch_size = min(batch_size, remaining_slots)
+        for _ in range(actual_batch_size):
+            self._samples.append([])
 
     def observe(self, query: torch.Tensor | None, key: torch.Tensor | None):
         if query is None or key is None:
             return
         if query.ndim < 3 or key.ndim < 3:
             return
+        
+        # Skip if we've already collected enough sequences
+        if self._sequence_count >= self.max_sequences:
+            return
+            
         with torch.no_grad():
             q = query.detach().float()
             k = key.detach().float()
-            q = q.reshape(-1, q.shape[-1])
-            k = k.reshape(-1, k.shape[-1])
-            total_q = q.shape[0]
-            total_k = k.shape[0]
-            if total_q == 0 or total_k == 0:
-                return
+            
+            # Average K over head dimension if it's not already 1
+            # Expected shapes: Q: [B, H, L, feature_dim], K: [B, H_kv, L, feature_dim] or [B, 1, L, feature_dim]
+            if k.shape[1] > 1:  # If K has multiple heads, average them
+                k = k.mean(dim=1, keepdim=True)  # [B, 1, L, feature_dim]
+            
+            # Now both Q and K have head dimension: Q: [B, H, L, feature_dim], K: [B, 1, L, feature_dim]
+            b, h_q, l, d = q.shape
+            b_k, h_k, l_k, d_k = k.shape
+            assert b == b_k and l == l_k and d == d_k, f"Shape mismatch: Q {q.shape} vs K {k.shape}"
+            
+            # Only process sequences up to max_sequences
+            remaining_slots = self.max_sequences - self._sequence_count
+            actual_b = min(b, remaining_slots)
+            
+            # Process each sequence in the batch separately - NO SAMPLING WITHIN SEQUENCE
+            for batch_idx in range(actual_b):
+                seq_idx = self._current_batch_start_idx + batch_idx
+                
+                if seq_idx >= len(self._samples):
+                    continue
+                
+                # Get data for this sequence
+                q_seq = q[batch_idx]  # [H, L, d]
+                k_seq = k[batch_idx].squeeze(0)  # [1, L, d] -> [L, d]
+                
+                # Compute complete Q @ K^T for each head: [H, L, d] @ [d, L] = [H, L, L]
+                # q_seq: [H, L, d], k_seq: [L, d]
+                # For each head h: q_seq[h] @ k_seq^T = [L, d] @ [d, L] = [L, L]
+                scores = torch.bmm(q_seq, k_seq.unsqueeze(0).expand(h_q, l, d).transpose(1, 2))  # [H, L, L]
+                
+                # Flatten to 1D: [H*L*L] - COMPLETE dot product matrix, no sampling
+                flat = scores.reshape(-1)  # [H*L*L]
+                
+                if flat.numel() == 0:
+                    continue
+                
+                # Save to disk if save_dir is provided, otherwise keep in memory
+                if self.save_dir is not None:
+                    import os
+                    os.makedirs(self.save_dir, exist_ok=True)
+                    # Save as numpy for efficiency
+                    import numpy as np
+                    file_path = os.path.join(self.save_dir, f"seq_{seq_idx}_layer_{len(self._samples[seq_idx])}.npy")
+                    np.save(file_path, flat.cpu().numpy())
+                    # Store file path instead of tensor
+                    self._samples[seq_idx].append(file_path)
+                else:
+                    # Store in memory
+                    self._samples[seq_idx].append(flat.to(dtype=torch.float32, device="cpu"))
+            
+            # Update sequence count
+            self._sequence_count += actual_b
 
-            target = self.samples_per_call if self.samples_per_call is not None else min(total_q, total_k)
-            target = max(1, target)
-            sample_q = max(1, min(int(math.sqrt(target)), total_q))
-            sample_k = max(1, min(target // sample_q if target >= sample_q else target, total_k))
+    def get_sequence_tensor(self, sequence_idx: int) -> torch.Tensor:
+        """Get concatenated tensor for a specific sequence."""
+        if sequence_idx >= len(self._samples) or len(self._samples[sequence_idx]) == 0:
+            return torch.empty(0, dtype=torch.float32)
+        
+        # Load from disk if saved, otherwise use in-memory tensors
+        tensors = []
+        for item in self._samples[sequence_idx]:
+            if isinstance(item, str):
+                # Load from disk
+                import numpy as np
+                arr = np.load(item)
+                tensors.append(torch.from_numpy(arr).float())
+            else:
+                # In-memory tensor
+                tensors.append(item)
+        
+        if not tensors:
+            return torch.empty(0, dtype=torch.float32)
+        return torch.cat(tensors)
 
-            q_idx = torch.randint(0, total_q, (sample_q,), device=q.device)
-            k_idx = torch.randint(0, total_k, (sample_k,), device=k.device)
-            q_sel = q.index_select(0, q_idx)
-            k_sel = k.index_select(0, k_idx)
-            scores = torch.matmul(q_sel, k_sel.transpose(0, 1))
-            flat = scores.reshape(-1)
-            if flat.numel() == 0:
-                return
-            if self.samples_per_call and flat.numel() > self.samples_per_call:
-                idx = torch.randint(0, flat.numel(), (self.samples_per_call,), device=flat.device)
-                flat = flat.index_select(0, idx)
-            self._samples.append(flat.to(dtype=torch.float32, device="cpu"))
+    def num_sequences(self) -> int:
+        """Return number of sequences collected."""
+        return len(self._samples)
 
     def to_tensor(self) -> torch.Tensor:
+        """Legacy method: concatenate all sequences. Use get_sequence_tensor for per-sequence access."""
         if not self._samples:
             return torch.empty(0, dtype=torch.float32)
-        return torch.cat(self._samples)
+        all_tensors = []
+        for seq_idx in range(len(self._samples)):
+            seq_tensor = self.get_sequence_tensor(seq_idx)
+            if seq_tensor.numel() > 0:
+                all_tensors.append(seq_tensor)
+        if not all_tensors:
+            return torch.empty(0, dtype=torch.float32)
+        return torch.cat(all_tensors)
 
     def num_values(self) -> int:
-        return sum(t.numel() for t in self._samples)
+        total = 0
+        for seq_samples in self._samples:
+            for item in seq_samples:
+                if isinstance(item, str):
+                    # Load from disk to count
+                    import numpy as np
+                    arr = np.load(item)
+                    total += arr.size
+                else:
+                    total += item.numel()
+        return total
 
     def summary(self) -> dict[str, float | int | str]:
         return {
@@ -311,41 +410,79 @@ def compute_qk_kl_divergence(
     target_monitor: QKDotProductMonitor | None,
     bins: int = 512,
     epsilon: float = 1e-8,
+    max_sequences: int = 10,
 ) -> float | None:
     """
-    Approximate KL(reference || target) using histograms of sampled dot products.
+    Approximate KL(reference || target) using histograms of dot products.
+    Computes KL divergence per sequence, then averages over sequences.
+    
+    Args:
+        reference_monitor: Monitor with reference (Phase 0) data
+        target_monitor: Monitor with target (Phase 1 or 2) data
+        bins: Number of histogram bins
+        epsilon: Small value to avoid log(0)
+        max_sequences: Maximum number of sequences to use (default 10)
+    
+    Returns:
+        Average KL divergence across sequences, or None if insufficient data
     """
     if reference_monitor is None or target_monitor is None:
         return None
 
-    reference = reference_monitor.to_tensor()
-    target = target_monitor.to_tensor()
-    if reference.numel() == 0 or target.numel() == 0:
+    num_ref_sequences = reference_monitor.num_sequences()
+    num_target_sequences = target_monitor.num_sequences()
+    
+    if num_ref_sequences == 0 or num_target_sequences == 0:
+        return None
+    
+    # Use minimum of available sequences and max_sequences
+    num_sequences = min(num_ref_sequences, num_target_sequences, max_sequences)
+    
+    if num_sequences == 0:
         return None
 
-    min_val = torch.minimum(reference.min(), target.min()).item()
-    max_val = torch.maximum(reference.max(), target.max()).item()
-    if not (math.isfinite(min_val) and math.isfinite(max_val)):
+    kl_values = []
+    
+    for seq_idx in range(num_sequences):
+        reference_seq = reference_monitor.get_sequence_tensor(seq_idx)
+        target_seq = target_monitor.get_sequence_tensor(seq_idx)
+        
+        if reference_seq.numel() == 0 or target_seq.numel() == 0:
+            continue
+        
+        # Find shared min/max for this sequence pair
+        min_val = torch.minimum(reference_seq.min(), target_seq.min()).item()
+        max_val = torch.maximum(reference_seq.max(), target_seq.max()).item()
+        
+        if not (math.isfinite(min_val) and math.isfinite(max_val)):
+            continue
+        if min_val == max_val:
+            kl_values.append(0.0)
+            continue
+        
+        span = max_val - min_val
+        margin = max(span * 0.01, 1e-3)
+        hist_min = min_val - margin
+        hist_max = max_val + margin
+        
+        # Compute histograms for this sequence
+        reference_hist = torch.histc(reference_seq, bins=bins, min=hist_min, max=hist_max)
+        target_hist = torch.histc(target_seq, bins=bins, min=hist_min, max=hist_max)
+        
+        if reference_hist.sum() == 0 or target_hist.sum() == 0:
+            continue
+        
+        reference_prob = reference_hist / reference_hist.sum()
+        target_prob = target_hist / target_hist.sum()
+        
+        kl = torch.sum(reference_prob * torch.log((reference_prob + epsilon) / (target_prob + epsilon)))
+        kl_values.append(kl.item())
+    
+    if len(kl_values) == 0:
         return None
-    if min_val == max_val:
-        return 0.0
-
-    span = max_val - min_val
-    margin = max(span * 0.01, 1e-3)
-    hist_min = min_val - margin
-    hist_max = max_val + margin
-
-    reference_hist = torch.histc(reference, bins=bins, min=hist_min, max=hist_max)
-    target_hist = torch.histc(target, bins=bins, min=hist_min, max=hist_max)
-
-    if reference_hist.sum() == 0 or target_hist.sum() == 0:
-        return None
-
-    reference_prob = reference_hist / reference_hist.sum()
-    target_prob = target_hist / target_hist.sum()
-
-    kl = torch.sum(reference_prob * torch.log((reference_prob + epsilon) / (target_prob + epsilon)))
-    return kl.item()
+    
+    # Return average KL divergence across sequences
+    return sum(kl_values) / len(kl_values)
     
 @torch.no_grad()
 def evaluate_ppl(
@@ -378,8 +515,16 @@ def evaluate_ppl(
 
     logging.info(message)
     try:
-        for batch in tqdm(testloader, desc=message):
+        for batch_idx, batch in enumerate(tqdm(testloader, desc=message)):
+            # Stop if we've collected enough sequences for QK monitoring
+            if qk_monitor is not None and qk_monitor._sequence_count >= qk_monitor.max_sequences:
+                break
+                
             logging.debug(f"Evaluating batch {len(nlls)}")
+            if qk_monitor is not None:
+                # Mark start of new batch to track sequences separately
+                batch_size = batch["input_ids"].shape[0] if isinstance(batch, dict) and "input_ids" in batch else 1
+                qk_monitor.start_batch(batch_size)
             batch = map_tensors(batch, model.model.embed_tokens.weight.device)
             logits = model(**batch, use_cache=False).logits
 

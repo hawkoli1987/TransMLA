@@ -72,7 +72,10 @@ def main(args):
     original_qk_monitor = None
     if test_loader:
         message = "Evaluating original model's ppl"
-        original_qk_monitor = QKDotProductMonitor(label="original")
+        # Use first 10 sequences, save to disk if needed
+        import os
+        save_dir = os.path.join(args.save_path, "qk_dot_products", "original") if hasattr(args, 'save_path') else None
+        original_qk_monitor = QKDotProductMonitor(label="original", max_sequences=10, save_dir=save_dir)
         dataset_ppl = evaluate_ppl(
             model,
             tokenizer.pad_token_id,

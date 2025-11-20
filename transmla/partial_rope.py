@@ -217,7 +217,19 @@ def partial_rope(model, tokenizer, train_loader, test_loader, baseline_qk_monito
             
         if test_loader:
             message = f"Evaluating partial-rope model's ppl, freqfold={freqfold}"
-            qk_monitor = QKDotProductMonitor(label=f"partial_rope_freqfold_{freqfold}") if baseline_monitor else None
+            # Use same max_sequences and save_dir as baseline to ensure same sequences are used
+            if baseline_monitor:
+                import os
+                # Get save_path from outer function's kwargs
+                save_path = kwargs.get("save_path", None)
+                save_dir = os.path.join(save_path, "qk_dot_products", f"partial_rope_freqfold_{freqfold}") if save_path else None
+                qk_monitor = QKDotProductMonitor(
+                    label=f"partial_rope_freqfold_{freqfold}",
+                    max_sequences=baseline_monitor.max_sequences,
+                    save_dir=save_dir
+                )
+            else:
+                qk_monitor = None
             dataset_ppl = evaluate_ppl(
                 model,
                 tokenizer.pad_token_id,
