@@ -70,6 +70,8 @@ class PartialRope(nn.Module):
         self.k_proj = self_attn.k_proj
         self.v_proj = self_attn.v_proj
         self.o_proj = self_attn.o_proj
+        self.q_norm = getattr(self_attn, "q_norm", None)
+        self.k_norm = getattr(self_attn, "k_norm", None)
         self._insert_kv_up_proj()
         if key_outputs is not None:
             Rk = self.joint_complex_pca(key_outputs, freqfold)
@@ -158,10 +160,15 @@ class PartialRope(nn.Module):
         bsz, q_len, _ = hidden_states.size()
 
         query_states = self.q_proj(hidden_states)
+        query_states = query_states.view(bsz, q_len, self.num_attention_heads, self.head_dim)
+        if self.q_norm is not None:
+            query_states = self.q_norm(query_states)
         key_states = self.k_proj(hidden_states)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
+        if self.k_norm is not None:
+            key_states = self.k_norm(key_states)
         value_states = self.v_proj(hidden_states)
 
-        query_states = query_states.view(bsz, q_len, self.num_attention_heads, self.head_dim)
         k_up_weight = self.k_up_proj.weight.view(self.num_attention_heads, self.head_dim, self.latent_dim)
         query_states = torch.einsum("bthd,hdc->bhtc", query_states, k_up_weight)
     

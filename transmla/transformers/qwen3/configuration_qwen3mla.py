@@ -13,6 +13,7 @@ class Qwen3MLAConfig(Qwen3Config):
         qk_nope_head_dim=128,
         v_head_dim=128,
         qk_latent_layernorm=True,
+        use_qk_head_norm=False,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -24,3 +25,4 @@ class Qwen3MLAConfig(Qwen3Config):
         self.qk_head_dim = qk_rope_head_dim + qk_nope_head_dim
         self.v_head_dim = v_head_dim
         self.qk_latent_layernorm = qk_latent_layernorm
+        self.use_qk_head_norm = use_qk_head_norm

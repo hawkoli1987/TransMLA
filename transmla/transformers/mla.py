@@ -42,6 +42,8 @@ class MLAAttention(nn.Module):
         self.qk_head_dim = config.qk_head_dim
 
         self.qk_latent_layernorm = getattr(config, "qk_latent_layernorm", True)
+        self.use_qk_head_norm = getattr(config, "use_qk_head_norm", False)
+        eps = getattr(config, "rms_norm_eps", 1e-6)
         
         self.is_causal = True
         if self.q_lora_rank is None:
@@ -64,6 +66,9 @@ class MLAAttention(nn.Module):
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
             bias=False,
         )
+        if self.use_qk_head_norm:
+            self.q_norm = DeepseekV3RMSNorm(self.qk_nope_head_dim, eps=eps)
+            self.k_norm = DeepseekV3RMSNorm(self.qk_nope_head_dim, eps=eps)
 
         self.o_proj = nn.Linear(
             self.num_heads * self.v_head_dim,
@@ -95,6 +100,8 @@ class MLAAttention(nn.Module):
             q_states = self.q_b_proj(self.q_a_proj(hidden_states))
         q_states = q_states.view(query_shape).transpose(1, 2)
         q_pass, q_rot = torch.split(q_states, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        if self.use_qk_head_norm:
+            q_pass = self.q_norm(q_pass)
 
         compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
         k_pass, k_rot = torch.split(compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
@@ -104,6 +111,8 @@ class MLAAttention(nn.Module):
         else:
             k_pass = self.kv_b_proj(k_pass).view(key_shape).transpose(1, 2)
         k_pass, value_states = torch.split(k_pass, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+        if self.use_qk_head_norm:
+            k_pass = self.k_norm(k_pass)
 
         k_rot = k_rot.view(batch_size, 1, seq_length, self.qk_rope_head_dim)
 

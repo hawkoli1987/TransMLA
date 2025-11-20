@@ -59,6 +59,8 @@ class LoraQKV(nn.Module):
 
         self.attention_function = ALL_ATTENTION_FUNCTIONS["sdpa"]
         self.scaling = (self.head_dim + self.qk_mqa_dim)**(-0.5)
+        self.q_norm = getattr(self_attn, "q_norm", None)
+        self.k_norm = getattr(self_attn, "k_norm", None)
 
         # -----------------Attributes for the bias-----------------
         q_bias = self_attn.q_proj.bias is not None
@@ -384,6 +386,8 @@ class LoraQKV(nn.Module):
         
         query_states = query_states.view(bsz, q_len, self.num_attention_heads, -1).transpose(1,2)
         q_nope, q_rope = query_states.split([self.head_dim, self.qk_mqa_dim], dim=-1)
+        if self.q_norm is not None:
+            q_nope = self.q_norm(q_nope)
 
         # key and value
         compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
@@ -399,6 +403,8 @@ class LoraQKV(nn.Module):
             kv_nope = self.kv_a_layernorm(kv_nope)
         kv_nope = self.kv_b_proj(kv_nope).view(bsz, q_len, self.num_attention_heads, self.head_dim * 2).transpose(1, 2)
         k_nope, value_states = kv_nope.split([self.head_dim, self.head_dim],dim=-1)
+        if self.k_norm is not None:
+            k_nope = self.k_norm(k_nope)
         key_states = torch.cat([k_nope, repeat_kv(k_rope, self.num_attention_heads)], dim=-1)
 
         attn_output, attn_weights = self.attention_function(
