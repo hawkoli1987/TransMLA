@@ -4,7 +4,13 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
 
 from modify_config import modify_config
-from utils import get_dataset, prepare_dataloader, prepare_test_dataloader, evaluate_ppl
+from utils import (
+    QKDotProductMonitor,
+    get_dataset,
+    prepare_dataloader,
+    prepare_test_dataloader,
+    evaluate_ppl,
+)
 from partial_rope import partial_rope
 from lora_qkv import low_rank_qkv
 
@@ -63,10 +69,22 @@ def main(args):
     # get dataset
     train_loader, test_loader = get_dataset_loader(tokenizer, **vars(args))
 
+    original_qk_monitor = None
     if test_loader:
         message = "Evaluating original model's ppl"
-        dataset_ppl = evaluate_ppl(model, tokenizer.pad_token_id, test_loader, message)
+        original_qk_monitor = QKDotProductMonitor(label="original")
+        dataset_ppl = evaluate_ppl(
+            model,
+            tokenizer.pad_token_id,
+            test_loader,
+            message,
+            qk_monitor=original_qk_monitor,
+        )
         print(f'Original ppl: {dataset_ppl:.4f}')
+        captured = original_qk_monitor.num_values()
+        print(f'Captured {captured} QK samples from original model')
+        if captured == 0:
+            print("Warning: QK monitoring disabled (no samples captured); KL divergence comparisons will be skipped.")
 
     ##############################
     #        partial rope        #
@@ -83,7 +101,14 @@ def main(args):
     else:
         args.collapse = int(args.collapse)
 
-    model = partial_rope(model, tokenizer, train_loader, test_loader, **vars(args))
+    model = partial_rope(
+        model,
+        tokenizer,
+        train_loader,
+        test_loader,
+        baseline_qk_monitor=original_qk_monitor,
+        **vars(args),
+    )
     if args.freqfold == "auto":
         args.freqfold = model[1]
         model = model[0]
@@ -95,7 +120,14 @@ def main(args):
     print("LoraQKV Model".center(60))
     print("="*60 + "\n")
 
-    model = low_rank_qkv(model, tokenizer, train_loader, test_loader, **vars(args))
+    model = low_rank_qkv(
+        model,
+        tokenizer,
+        train_loader,
+        test_loader,
+        baseline_qk_monitor=original_qk_monitor,
+        **vars(args),
+    )
 
     # save model
     print(f"\nSaving model and tokenizer to {args.save_path}...")

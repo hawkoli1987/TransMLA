@@ -5,7 +5,15 @@ from typing import Optional, Tuple
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.models.deepseek_v3.modeling_deepseek_v3 import apply_rotary_pos_emb_interleave
 
-from utils import pca_calc, get_qkv_calibrate_outputs, evaluate_ppl, statistics_qkv_rmsnorm, use_original_norm_weights
+from utils import (
+    QKDotProductMonitor,
+    compute_qk_kl_divergence,
+    pca_calc,
+    get_qkv_calibrate_outputs,
+    evaluate_ppl,
+    statistics_qkv_rmsnorm,
+    use_original_norm_weights,
+)
 
  
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -410,7 +418,7 @@ class LoraQKV(nn.Module):
         return attn_output, attn_weights
 
 
-def low_rank_qkv(model, tokenizer, train_loader, test_loader, **kwargs):
+def low_rank_qkv(model, tokenizer, train_loader, test_loader, baseline_qk_monitor=None, **kwargs):
 
     message = "Calibrating rope-removed model's qkv outputs"
     rm_rope_qkv_outputs = get_qkv_calibrate_outputs(model, train_loader, message)
@@ -466,7 +474,20 @@ def low_rank_qkv(model, tokenizer, train_loader, test_loader, **kwargs):
 
     if test_loader:
         message = "Evaluating lora-qkv model's ppl"
-        dataset_ppl = evaluate_ppl(model, tokenizer.pad_token_id, test_loader, message)
+        qk_monitor = QKDotProductMonitor(label="lora_qkv") if baseline_qk_monitor else None
+        dataset_ppl = evaluate_ppl(
+            model,
+            tokenizer.pad_token_id,
+            test_loader,
+            message,
+            qk_monitor=qk_monitor,
+        )
         print(f'Low rank approximate QKV ppl: {dataset_ppl:.4f}')
+        if baseline_qk_monitor and qk_monitor:
+            kl_value = compute_qk_kl_divergence(baseline_qk_monitor, qk_monitor)
+            if kl_value is not None:
+                print(f"LoraQKV QK KL vs original: {kl_value:.6f}")
+            else:
+                print("LoraQKV QK KL vs original: unavailable (insufficient samples)")
     
     return model

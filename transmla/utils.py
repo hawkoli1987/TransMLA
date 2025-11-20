@@ -1,6 +1,8 @@
 import logging
+import math
 import time
 import torch
+import torch.nn.functional as F
 import datasets
 from torch.utils.data import DataLoader, Dataset, SubsetRandomSampler
 from transformers import PreTrainedTokenizerBase
@@ -201,13 +203,157 @@ def map_tensors(obj, device: torch.device | str | None = None, dtype: torch.dtyp
         return {k: map_tensors(v, device, dtype) for k, v in obj.items()}  # type: ignore
     else:
         return obj
+
+
+class _ScaledDotProductAttentionCapture:
+    """
+    Lightweight hook manager that intercepts torch.nn.functional.scaled_dot_product_attention
+    calls so we can observe the query/key tensors without modifying model code.
+    """
+
+    _orig_fn = None
+    _monitor_stack: "list[QKDotProductMonitor]" = []
+
+    @classmethod
+    def enable(cls, monitor: "QKDotProductMonitor | None"):
+        if monitor is None:
+            return
+        if cls._orig_fn is None:
+            cls._orig_fn = F.scaled_dot_product_attention
+
+            def wrapped(*args, **kwargs):
+                query = kwargs.get("query") if "query" in kwargs else (args[0] if len(args) > 0 else None)
+                key = kwargs.get("key") if "key" in kwargs else (args[1] if len(args) > 1 else None)
+                if cls._monitor_stack and (query is not None and key is not None):
+                    try:
+                        cls._monitor_stack[-1].observe(query, key)
+                    except Exception:
+                        logging.exception("Failed to capture QK dot products during attention call")
+                return cls._orig_fn(*args, **kwargs)
+
+            F.scaled_dot_product_attention = wrapped  # type: ignore[assignment]
+        cls._monitor_stack.append(monitor)
+
+    @classmethod
+    def disable(cls, monitor: "QKDotProductMonitor | None"):
+        if monitor is None:
+            return
+        if monitor in cls._monitor_stack:
+            cls._monitor_stack = [m for m in cls._monitor_stack if m is not monitor]
+        if not cls._monitor_stack and cls._orig_fn is not None:
+            F.scaled_dot_product_attention = cls._orig_fn  # type: ignore[assignment]
+            cls._orig_fn = None
+
+
+class QKDotProductMonitor:
+    """
+    Collects sampled QK dot products across attention calls to approximate their distribution.
+    """
+
+    def __init__(self, label: str = "", samples_per_call: int = 2048):
+        self.label = label
+        self.samples_per_call = samples_per_call
+        self._samples: list[torch.Tensor] = []
+
+    def reset(self):
+        self._samples.clear()
+
+    def observe(self, query: torch.Tensor | None, key: torch.Tensor | None):
+        if query is None or key is None:
+            return
+        if query.ndim < 3 or key.ndim < 3:
+            return
+        with torch.no_grad():
+            q = query.detach().float()
+            k = key.detach().float()
+            q = q.reshape(-1, q.shape[-1])
+            k = k.reshape(-1, k.shape[-1])
+            total_q = q.shape[0]
+            total_k = k.shape[0]
+            if total_q == 0 or total_k == 0:
+                return
+
+            target = self.samples_per_call if self.samples_per_call is not None else min(total_q, total_k)
+            target = max(1, target)
+            sample_q = max(1, min(int(math.sqrt(target)), total_q))
+            sample_k = max(1, min(target // sample_q if target >= sample_q else target, total_k))
+
+            q_idx = torch.randint(0, total_q, (sample_q,), device=q.device)
+            k_idx = torch.randint(0, total_k, (sample_k,), device=k.device)
+            q_sel = q.index_select(0, q_idx)
+            k_sel = k.index_select(0, k_idx)
+            scores = torch.matmul(q_sel, k_sel.transpose(0, 1))
+            flat = scores.reshape(-1)
+            if flat.numel() == 0:
+                return
+            if self.samples_per_call and flat.numel() > self.samples_per_call:
+                idx = torch.randint(0, flat.numel(), (self.samples_per_call,), device=flat.device)
+                flat = flat.index_select(0, idx)
+            self._samples.append(flat.to(dtype=torch.float32, device="cpu"))
+
+    def to_tensor(self) -> torch.Tensor:
+        if not self._samples:
+            return torch.empty(0, dtype=torch.float32)
+        return torch.cat(self._samples)
+
+    def num_values(self) -> int:
+        return sum(t.numel() for t in self._samples)
+
+    def summary(self) -> dict[str, float | int | str]:
+        return {
+            "label": self.label,
+            "num_values": self.num_values(),
+        }
+
+
+def compute_qk_kl_divergence(
+    reference_monitor: QKDotProductMonitor | None,
+    target_monitor: QKDotProductMonitor | None,
+    bins: int = 512,
+    epsilon: float = 1e-8,
+) -> float | None:
+    """
+    Approximate KL(reference || target) using histograms of sampled dot products.
+    """
+    if reference_monitor is None or target_monitor is None:
+        return None
+
+    reference = reference_monitor.to_tensor()
+    target = target_monitor.to_tensor()
+    if reference.numel() == 0 or target.numel() == 0:
+        return None
+
+    min_val = torch.minimum(reference.min(), target.min()).item()
+    max_val = torch.maximum(reference.max(), target.max()).item()
+    if not (math.isfinite(min_val) and math.isfinite(max_val)):
+        return None
+    if min_val == max_val:
+        return 0.0
+
+    span = max_val - min_val
+    margin = max(span * 0.01, 1e-3)
+    hist_min = min_val - margin
+    hist_max = max_val + margin
+
+    reference_hist = torch.histc(reference, bins=bins, min=hist_min, max=hist_max)
+    target_hist = torch.histc(target, bins=bins, min=hist_min, max=hist_max)
+
+    if reference_hist.sum() == 0 or target_hist.sum() == 0:
+        return None
+
+    reference_prob = reference_hist / reference_hist.sum()
+    target_prob = target_hist / target_hist.sum()
+
+    kl = torch.sum(reference_prob * torch.log((reference_prob + epsilon) / (target_prob + epsilon)))
+    return kl.item()
     
 @torch.no_grad()
 def evaluate_ppl(
     model: torch.nn.Module, 
     pad_token_id: int | None, 
     testloader: DataLoader[dict[str, torch.Tensor]], 
-    message: str = "Evaluating perplexity"
+    message: str = "Evaluating perplexity",
+    qk_monitor: QKDotProductMonitor | None = None,
 ) -> float:
     """
     Evaluate the model's perplexity on the test set using batch processing.
@@ -226,22 +372,30 @@ def evaluate_ppl(
 
     nlls = []
 
+    if qk_monitor is not None:
+        qk_monitor.reset()
+        _ScaledDotProductAttentionCapture.enable(qk_monitor)
+
     logging.info(message)
-    for batch in tqdm(testloader, desc=message):
-        logging.debug(f"Evaluating batch {len(nlls)}")
-        batch = map_tensors(batch, model.model.embed_tokens.weight.device)
-        logits = model(**batch, use_cache=False).logits
+    try:
+        for batch in tqdm(testloader, desc=message):
+            logging.debug(f"Evaluating batch {len(nlls)}")
+            batch = map_tensors(batch, model.model.embed_tokens.weight.device)
+            logits = model(**batch, use_cache=False).logits
 
-        # shift outputs and labels autoregressively.
-        logits = logits[:, :-1, :]
-        shift_labels = batch["input_ids"][:, 1:]
+            # shift outputs and labels autoregressively.
+            logits = logits[:, :-1, :]
+            shift_labels = batch["input_ids"][:, 1:]
 
-        # CrossEntropyLoss demands data dimension is dimension 1.
-        nll = loss_fn(logits.permute(0, 2, 1), shift_labels).float()
+            # CrossEntropyLoss demands data dimension is dimension 1.
+            nll = loss_fn(logits.permute(0, 2, 1), shift_labels).float()
 
-        mask = shift_labels != loss_fn.ignore_index
-        nll_means = (nll * mask).sum(dim=1) / mask.sum(dim=1)
-        nlls.append(nll_means)
+            mask = shift_labels != loss_fn.ignore_index
+            nll_means = (nll * mask).sum(dim=1) / mask.sum(dim=1)
+            nlls.append(nll_means)
+    finally:
+        if qk_monitor is not None:
+            _ScaledDotProductAttentionCapture.disable(qk_monitor)
 
     nlls_tensor = torch.cat(nlls)
     ppl = torch.exp(nlls_tensor.mean())

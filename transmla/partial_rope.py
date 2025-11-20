@@ -4,7 +4,12 @@ from copy import deepcopy
 from typing import Optional, Tuple
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
-from utils import get_qkv_calibrate_outputs, evaluate_ppl
+from utils import (
+    QKDotProductMonitor,
+    compute_qk_kl_divergence,
+    get_qkv_calibrate_outputs,
+    evaluate_ppl,
+)
 
 def rotate_half(x, group):
     rotate_x = []
@@ -193,7 +198,7 @@ class PartialRope(nn.Module):
 
 
 
-def partial_rope(model, tokenizer, train_loader, test_loader, **kwargs):
+def partial_rope(model, tokenizer, train_loader, test_loader, baseline_qk_monitor=None, **kwargs):
 
     freqfold = kwargs["freqfold"]
     collapse = kwargs["collapse"]
@@ -201,7 +206,7 @@ def partial_rope(model, tokenizer, train_loader, test_loader, **kwargs):
     message = "Calibrating original model's qkv outputs"
     ori_qkv_outputs = get_qkv_calibrate_outputs(model, train_loader, message)
 
-    def partial_rope_freqfold(model, ori_qkv_outputs, test_loader, freqfold: int, collapse):
+    def partial_rope_freqfold(model, ori_qkv_outputs, test_loader, freqfold: int, collapse, baseline_monitor):
         for layer_idx, layer in enumerate(model.model.layers):
             setattr(layer, "self_attn", PartialRope(
                 layer.self_attn, 
@@ -212,15 +217,28 @@ def partial_rope(model, tokenizer, train_loader, test_loader, **kwargs):
             
         if test_loader:
             message = f"Evaluating partial-rope model's ppl, freqfold={freqfold}"
-            dataset_ppl = evaluate_ppl(model, tokenizer.pad_token_id, test_loader, message)
+            qk_monitor = QKDotProductMonitor(label=f"partial_rope_freqfold_{freqfold}") if baseline_monitor else None
+            dataset_ppl = evaluate_ppl(
+                model,
+                tokenizer.pad_token_id,
+                test_loader,
+                message,
+                qk_monitor=qk_monitor,
+            )
             print(f'Partial RoPE ppl, freqfold={freqfold}: {dataset_ppl:.4f}')
+            if baseline_monitor and qk_monitor:
+                kl_value = compute_qk_kl_divergence(baseline_monitor, qk_monitor)
+                if kl_value is not None:
+                    print(f"Partial RoPE QK KL vs original: {kl_value:.6f}")
+                else:
+                    print("Partial RoPE QK KL vs original: unavailable (insufficient samples)")
             return model, dataset_ppl
         else:
             return model, None
 
     if freqfold != "auto":
         freqfold = int(freqfold)
-        return partial_rope_freqfold(model, ori_qkv_outputs, test_loader, freqfold, collapse)[0]
+        return partial_rope_freqfold(model, ori_qkv_outputs, test_loader, freqfold, collapse, baseline_qk_monitor)[0]
     else:
         assert test_loader is not None, "test_loader is required for auto freqfold detection"
         device = model.device
@@ -233,7 +251,7 @@ def partial_rope(model, tokenizer, train_loader, test_loader, **kwargs):
         while freqfold <= model_original.config.head_dim // 2:
             model = deepcopy(model_original)
             model = model.to(device)
-            model, ppl = partial_rope_freqfold(model, ori_qkv_outputs, test_loader, freqfold, collapse)
+            model, ppl = partial_rope_freqfold(model, ori_qkv_outputs, test_loader, freqfold, collapse, baseline_qk_monitor)
             if ppl < best_ppl:
                 best_ppl = ppl
                 best_freqfold = freqfold
@@ -243,7 +261,7 @@ def partial_rope(model, tokenizer, train_loader, test_loader, **kwargs):
 
         model = deepcopy(model_original)
         model = model.to(device)
-        model, _ = partial_rope_freqfold(model, ori_qkv_outputs, None, best_freqfold, collapse)
+        model, _ = partial_rope_freqfold(model, ori_qkv_outputs, None, best_freqfold, collapse, baseline_qk_monitor)
 
         print(f"Best freqfold: {best_freqfold}")
 
