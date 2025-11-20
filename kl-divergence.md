@@ -5,8 +5,13 @@ This document explains how KL divergence between Q K dot-product distributions
 ### Evaluation Flow
 - **Dataset**: Both the original model and the converted checkpoints (Partial RoPE and LoraQKV) run on the *same* test dataloader produced by `prepare_test_dataloader()` (defaults: WikiText2 test split, batch size taken from `--ppl-eval-batch-size`, sequence length 2048). This guarantees identical samples.
 - **Phase coverage**:
-  - *Phase 0 (Original)*: `evaluate_ppl()` is called once on the unmodified model with `qk_monitor=QKDotProductMonitor("original")`. Samples captured here become the baseline distribution.
-  - *Phase 1 (Partial RoPE)* and *Phase 2 (LoraQKV)*: their evaluation calls reuse the same test loader and enable their own monitors. Each phase prints its perplexity and the KL divergence vs. the baseline.
+  - *Phase 0 (Original)*: `evaluate_ppl()` is called once on the unmodified model with `qk_monitor=QKDotProductMonitor("original")`. Samples captured here become the baseline distribution (`original_qk_monitor`).
+  - *Phase 1 (Partial RoPE)*: Evaluates with its own monitor, then computes `KL(original || phase1)` using `compute_qk_kl_divergence(original_qk_monitor, phase1_monitor)` (line 230 in `partial_rope.py`). Prints: `"Partial RoPE QK KL vs original: ..."`
+  - *Phase 2 (LoraQKV)*: Evaluates with its own monitor, then computes `KL(original || phase2)` using `compute_qk_kl_divergence(original_qk_monitor, phase2_monitor)` (line 487 in `lora_qkv.py`). Prints: `"LoraQKV QK KL vs original: ..."`
+
+**Confirmation**: Both Phase 1 and Phase 2 compute KL divergence **against Phase 0 (original) as the baseline**:
+- Phase 1 KL = `KL(original || phase1)`
+- Phase 2 KL = `KL(original || phase2)`
 
 ### Q K Sampling Logic
 1. We intercept `torch.nn.functional.scaled_dot_product_attention` through `_ScaledDotProductAttentionCapture`.
@@ -132,16 +137,20 @@ All three phases use the **same test dataloader object**:
 **Implication**: The comparison ignores matrix structure and focuses on whether the **distribution of attention score magnitudes** is preserved across phases, even though the specific sampled points and their values are different.
 
 ### Histogram-Based KL Estimate
-- Let `P` denote the histogram of baseline scores and `Q` denote the histogram for a converted model.
+- Let `P` denote the histogram of **Phase 0 (original)** scores and `Q` denote the histogram for a **converted model** (Phase 1 or Phase 2).
 - We build 512 bins spanning the combined min/max range with a small margin, normalize each histogram, then evaluate:
 
 ```
 KL(P‖Q) = Σ_i  P_i * log((P_i + ε) / (Q_i + ε))    with ε = 1e-8
 ```
 
+Where:
+- For Phase 1: `P` = original distribution, `Q` = Phase 1 (Partial RoPE) distribution → `KL(original || phase1)`
+- For Phase 2: `P` = original distribution, `Q` = Phase 2 (LoraQKV) distribution → `KL(original || phase2)`
+
 - The result is printed after each phase:
-  - `Partial RoPE QK KL vs original: …`
-  - `LoraQKV QK KL vs original: …`
+  - `Partial RoPE QK KL vs original: …` (Phase 1 vs Phase 0)
+  - `LoraQKV QK KL vs original: …` (Phase 2 vs Phase 0)
 
 ### Interpreting KL Values
 - **Good conversion**: KL near zero (≤ 0.1) indicates the converted attention scores closely match the original distribution—expected when perplexity regresses minimally.
