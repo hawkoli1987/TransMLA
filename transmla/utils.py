@@ -324,49 +324,85 @@ class QKDotProductMonitor:
                 # For each head h: q_seq[h] @ k_seq^T = [L, d] @ [d, L] = [L, L]
                 scores = torch.bmm(q_seq, k_seq.unsqueeze(0).expand(h_q, l, d).transpose(1, 2))  # [H, L, L]
                 
-                # Flatten to 1D: [H*L*L] - COMPLETE dot product matrix, no sampling
-                flat = scores.reshape(-1)  # [H*L*L]
+                # Print shape for first sequence, first layer
+                if seq_idx == 0 and len(self._samples[seq_idx]) == 0:
+                    print(f"[{self.label}] First sequence (seq_0) dot product tensor shape:")
+                    print(f"  - Shape: {scores.shape} (Q @ K^T matrix: [H={h_q}, L={l}, L={l}])")
+                    print(f"  - Will compute KL per head: each head has shape [L={l}, L={l}]")
                 
-                if flat.numel() == 0:
+                if scores.numel() == 0:
                     continue
                 
-                # Save to disk if save_dir is provided, otherwise keep in memory
-                if self.save_dir is not None:
-                    import os
-                    os.makedirs(self.save_dir, exist_ok=True)
-                    # Save as numpy for efficiency
-                    import numpy as np
-                    file_path = os.path.join(self.save_dir, f"seq_{seq_idx}_layer_{len(self._samples[seq_idx])}.npy")
-                    np.save(file_path, flat.cpu().numpy())
-                    # Store file path instead of tensor
-                    self._samples[seq_idx].append(file_path)
-                else:
-                    # Store in memory
-                    self._samples[seq_idx].append(flat.to(dtype=torch.float32, device="cpu"))
+                # Store per head: split [H, L, L] into H separate [L, L] matrices
+                # Keep as [L, L] shape (not flattened) so we can compute KL per row
+                layer_data = []  # List to store data for this layer (one per head)
+                for head_idx in range(h_q):
+                    head_scores = scores[head_idx]  # [L, L] - keep 2D shape
+                    
+                    if self.save_dir is not None:
+                        import os
+                        os.makedirs(self.save_dir, exist_ok=True)
+                        import numpy as np
+                        file_path = os.path.join(self.save_dir, f"seq_{seq_idx}_layer_{len(self._samples[seq_idx])}_head_{head_idx}.npy")
+                        np.save(file_path, head_scores.cpu().numpy())  # Save as [L, L] shape
+                        layer_data.append(file_path)
+                    else:
+                        layer_data.append(head_scores.to(dtype=torch.float32, device="cpu"))  # Keep as [L, L]
+                
+                # Store all heads for this layer
+                self._samples[seq_idx].append(layer_data)
             
             # Update sequence count
             self._sequence_count += actual_b
 
     def get_sequence_tensor(self, sequence_idx: int) -> torch.Tensor:
-        """Get concatenated tensor for a specific sequence."""
+        """Get concatenated tensor for a specific sequence (legacy method, kept for compatibility)."""
         if sequence_idx >= len(self._samples) or len(self._samples[sequence_idx]) == 0:
             return torch.empty(0, dtype=torch.float32)
         
         # Load from disk if saved, otherwise use in-memory tensors
         tensors = []
-        for item in self._samples[sequence_idx]:
-            if isinstance(item, str):
-                # Load from disk
-                import numpy as np
-                arr = np.load(item)
-                tensors.append(torch.from_numpy(arr).float())
-            else:
-                # In-memory tensor
-                tensors.append(item)
+        for layer_data in self._samples[sequence_idx]:
+            # layer_data is a list of head tensors/paths
+            for head_item in layer_data:
+                if isinstance(head_item, str):
+                    # Load from disk
+                    import numpy as np
+                    arr = np.load(head_item)
+                    tensors.append(torch.from_numpy(arr).float())
+                else:
+                    # In-memory tensor
+                    tensors.append(head_item)
         
         if not tensors:
             return torch.empty(0, dtype=torch.float32)
         return torch.cat(tensors)
+    
+    def get_sequence_head_tensors(self, sequence_idx: int) -> list[list[torch.Tensor]]:
+        """
+        Get tensors organized by layer and head: returns list[list[torch.Tensor]]
+        Outer list: layers, inner list: heads
+        Each head tensor has shape [L, L] (2D matrix, not flattened)
+        """
+        if sequence_idx >= len(self._samples) or len(self._samples[sequence_idx]) == 0:
+            return []
+        
+        result = []
+        for layer_data in self._samples[sequence_idx]:
+            # layer_data is a list of head tensors/paths
+            head_tensors = []
+            for head_item in layer_data:
+                if isinstance(head_item, str):
+                    # Load from disk
+                    import numpy as np
+                    arr = np.load(head_item)
+                    head_tensors.append(torch.from_numpy(arr).float())
+                else:
+                    # In-memory tensor
+                    head_tensors.append(head_item)
+            result.append(head_tensors)
+        
+        return result
 
     def num_sequences(self) -> int:
         """Return number of sequences collected."""
@@ -388,14 +424,16 @@ class QKDotProductMonitor:
     def num_values(self) -> int:
         total = 0
         for seq_samples in self._samples:
-            for item in seq_samples:
-                if isinstance(item, str):
-                    # Load from disk to count
-                    import numpy as np
-                    arr = np.load(item)
-                    total += arr.size
-                else:
-                    total += item.numel()
+            for layer_data in seq_samples:
+                # layer_data is a list of head tensors/paths
+                for head_item in layer_data:
+                    if isinstance(head_item, str):
+                        # Load from disk to count
+                        import numpy as np
+                        arr = np.load(head_item)
+                        total += arr.size
+                    else:
+                        total += head_item.numel()
         return total
 
     def summary(self) -> dict[str, float | int | str]:
@@ -441,48 +479,99 @@ def compute_qk_kl_divergence(
     if num_sequences == 0:
         return None
 
-    kl_values = []
+    # New approach: compute KL per head, then average
+    # Structure: reference_heads[seq_idx][layer_idx][head_idx] = tensor[L*L]
+    all_head_kl_values = []
     
     for seq_idx in range(num_sequences):
-        reference_seq = reference_monitor.get_sequence_tensor(seq_idx)
-        target_seq = target_monitor.get_sequence_tensor(seq_idx)
+        reference_heads = reference_monitor.get_sequence_head_tensors(seq_idx)  # list[list[tensor]]
+        target_heads = target_monitor.get_sequence_head_tensors(seq_idx)  # list[list[tensor]]
         
-        if reference_seq.numel() == 0 or target_seq.numel() == 0:
+        if not reference_heads or not target_heads:
             continue
         
-        # Find shared min/max for this sequence pair
-        min_val = torch.minimum(reference_seq.min(), target_seq.min()).item()
-        max_val = torch.maximum(reference_seq.max(), target_seq.max()).item()
-        
-        if not (math.isfinite(min_val) and math.isfinite(max_val)):
-            continue
-        if min_val == max_val:
-            kl_values.append(0.0)
+        # Ensure same number of layers
+        num_layers = min(len(reference_heads), len(target_heads))
+        if num_layers == 0:
             continue
         
-        span = max_val - min_val
-        margin = max(span * 0.01, 1e-3)
-        hist_min = min_val - margin
-        hist_max = max_val + margin
-        
-        # Compute histograms for this sequence
-        reference_hist = torch.histc(reference_seq, bins=bins, min=hist_min, max=hist_max)
-        target_hist = torch.histc(target_seq, bins=bins, min=hist_min, max=hist_max)
-        
-        if reference_hist.sum() == 0 or target_hist.sum() == 0:
-            continue
-        
-        reference_prob = reference_hist / reference_hist.sum()
-        target_prob = target_hist / target_hist.sum()
-        
-        kl = torch.sum(reference_prob * torch.log((reference_prob + epsilon) / (target_prob + epsilon)))
-        kl_values.append(kl.item())
+        # For each layer, compute KL per head
+        for layer_idx in range(num_layers):
+            ref_layer_heads = reference_heads[layer_idx]  # list[tensor], one per head
+            tgt_layer_heads = target_heads[layer_idx]  # list[tensor], one per head
+            
+            if not ref_layer_heads or not tgt_layer_heads:
+                continue
+            
+            # Ensure same number of heads
+            num_heads = min(len(ref_layer_heads), len(tgt_layer_heads))
+            if num_heads == 0:
+                continue
+            
+            # Compute KL for each head separately
+            for head_idx in range(num_heads):
+                ref_head = ref_layer_heads[head_idx]  # tensor[L, L]
+                tgt_head = tgt_layer_heads[head_idx]  # tensor[L, L]
+                
+                if ref_head.numel() == 0 or tgt_head.numel() == 0:
+                    continue
+                
+                # Ensure both are 2D [L, L] matrices
+                if ref_head.ndim != 2 or tgt_head.ndim != 2:
+                    # If flattened, reshape back to [L, L]
+                    L = int(math.sqrt(ref_head.numel()))
+                    ref_head = ref_head.reshape(L, L)
+                    tgt_head = tgt_head.reshape(L, L)
+                
+                L = ref_head.shape[0]
+                head_row_kl_values = []
+                
+                # Compute KL for each row separately
+                for row_idx in range(L):
+                    ref_row = ref_head[row_idx]  # [L]
+                    tgt_row = tgt_head[row_idx]  # [L]
+                    
+                    if ref_row.numel() == 0 or tgt_row.numel() == 0:
+                        continue
+                    
+                    # Find shared min/max for this row pair
+                    min_val = torch.minimum(ref_row.min(), tgt_row.min()).item()
+                    max_val = torch.maximum(ref_row.max(), tgt_row.max()).item()
+                    
+                    if not (math.isfinite(min_val) and math.isfinite(max_val)):
+                        continue
+                    if min_val == max_val:
+                        head_row_kl_values.append(0.0)
+                        continue
+                    
+                    span = max_val - min_val
+                    margin = max(span * 0.01, 1e-3)
+                    hist_min = min_val - margin
+                    hist_max = max_val + margin
+                    
+                    # Compute histograms for this row
+                    reference_hist = torch.histc(ref_row, bins=bins, min=hist_min, max=hist_max)
+                    target_hist = torch.histc(tgt_row, bins=bins, min=hist_min, max=hist_max)
+                    
+                    if reference_hist.sum() == 0 or target_hist.sum() == 0:
+                        continue
+                    
+                    reference_prob = reference_hist / reference_hist.sum()
+                    target_prob = target_hist / target_hist.sum()
+                    
+                    kl = torch.sum(reference_prob * torch.log((reference_prob + epsilon) / (target_prob + epsilon)))
+                    head_row_kl_values.append(kl.item())
+                
+                # Average KL across all rows for this head
+                if head_row_kl_values:
+                    head_kl = sum(head_row_kl_values) / len(head_row_kl_values)
+                    all_head_kl_values.append(head_kl)
     
-    if len(kl_values) == 0:
+    if len(all_head_kl_values) == 0:
         return None
     
-    # Return average KL divergence across sequences
-    return sum(kl_values) / len(kl_values)
+    # Return average KL divergence across all heads (and sequences and layers)
+    return sum(all_head_kl_values) / len(all_head_kl_values)
     
 @torch.no_grad()
 def evaluate_ppl(
