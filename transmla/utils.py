@@ -494,3 +494,203 @@ def statistics_qkv_rmsnorm(self_attn, q_a_outputs, kv_a_outputs):
     kv_a_proj = torch.cat(kv_a_outputs)
     kv_a_rmsnorm = torch.rsqrt(kv_a_proj.pow(2).mean(-1) + self_attn.kv_a_layernorm.eps).mean()
     self_attn.kv_a_layernorm.weight.data = torch.full_like(self_attn.kv_a_layernorm.weight.data, kv_a_rmsnorm)
+
+@torch.no_grad()
+def extract_qk_from_model(model: torch.nn.Module, hidden_states: torch.Tensor, layer_idx: int, attention_mask=None):
+    """
+    Extract Q and K tensors from a model layer for QK dot product calculation.
+    
+    Handles different model types:
+    - Original Qwen3: standard q_proj and k_proj
+    - PartialRope: q_proj and k_proj with k_up_proj
+    - LoraQKV: q_a_proj/q_b_proj and kv_a_proj_with_mqa/kv_b_proj structure
+    
+    Returns:
+        Tuple of (Q, K) tensors in shape [batch, num_heads, seq_len, head_dim]
+    """
+    layer = model.model.layers[layer_idx]
+    self_attn = layer.self_attn
+    
+    num_heads = model.config.num_attention_heads
+    head_dim = getattr(model.config, 'head_dim', model.config.hidden_size // num_heads)
+    num_kv_heads = getattr(model.config, 'num_key_value_heads', num_heads)
+    
+    # Handle different attention structures
+    if hasattr(self_attn, 'q_a_proj') and hasattr(self_attn, 'kv_a_proj_with_mqa'):
+        # LoraQKV structure
+        # Reconstruct Q and K from LoRA structure
+        q_a = self_attn.q_a_proj(hidden_states)
+        if hasattr(self_attn, 'q_a_layernorm'):
+            q_a = self_attn.q_a_layernorm(q_a)
+        q = self_attn.q_b_proj(q_a)  # [batch, seq_len, num_heads * (head_dim + qk_mqa_dim)]
+        q = q.view(-1, q.size(1), num_heads, -1).transpose(1, 2)  # [batch, num_heads, seq_len, head_dim + qk_mqa_dim]
+        # Use only head_dim for comparison
+        q = q[..., :head_dim]
+        
+        # For K: need to reconstruct from kv_a_proj_with_mqa and kv_b_proj
+        kv_compressed = self_attn.kv_a_proj_with_mqa(hidden_states)  # [batch, seq_len, kv_lora_rank + qk_mqa_dim]
+        kv_nope, k_rope = kv_compressed.split([self_attn.kv_lora_rank, self_attn.qk_mqa_dim], dim=-1)
+        kv_nope = kv_nope.view(-1, 1, kv_nope.size(1), self_attn.kv_lora_rank)  # [batch, 1, seq_len, kv_lora_rank]
+        if hasattr(self_attn, 'kv_a_layernorm'):
+            kv_nope = self_attn.kv_a_layernorm(kv_nope)
+        kv_expanded = self_attn.kv_b_proj(kv_nope)  # [batch, 1, seq_len, num_heads * head_dim * 2]
+        kv_expanded = kv_expanded.view(-1, kv_expanded.size(2), num_heads, head_dim * 2).transpose(1, 2)
+        k_nope, _ = kv_expanded.split([head_dim, head_dim], dim=-1)
+        # For simplicity, use only k_nope (ignore k_rope for QK comparison)
+        k = k_nope  # [batch, num_heads, seq_len, head_dim]
+        
+    elif hasattr(self_attn, 'k_up_proj'):
+        # PartialRope structure
+        # In PartialRope, Q and K are transformed to latent_dim space, but for comparison
+        # with original model (head_dim), we expand both back to head_dim
+        k_up_weight = self_attn.k_up_proj.weight.view(num_heads, head_dim, self_attn.latent_dim)
+        k_up_weight_T = k_up_weight.transpose(-2, -1)  # [num_heads, latent_dim, head_dim] for inverse transform
+        
+        # Q: q_proj -> reshape -> transform to latent_dim -> expand back to head_dim
+        q = self_attn.q_proj(hidden_states)  # [batch, seq_len, num_heads * head_dim]
+        q = q.view(-1, q.size(1), num_heads, head_dim)  # [batch, seq_len, num_heads, head_dim]
+        q_latent = torch.einsum("bthd,hdc->bhtc", q, k_up_weight)  # [batch, num_heads, seq_len, latent_dim]
+        q = torch.einsum("bhtc,hcd->bhtd", q_latent, k_up_weight_T)  # [batch, num_heads, seq_len, head_dim]
+        # Q is already in correct shape [batch, num_heads, seq_len, head_dim]
+        
+        # K: k_proj -> reshape -> expand to head_dim
+        k_latent = self_attn.k_proj(hidden_states)  # [batch, seq_len, latent_dim]
+        k_latent = k_latent.view(-1, 1, k_latent.size(1), self_attn.latent_dim)  # [batch, 1, seq_len, latent_dim]
+        k = torch.einsum("b1td,hdc->bhtd", k_latent, k_up_weight)  # [batch, num_heads, seq_len, head_dim]
+        
+    else:
+        # Standard structure (original Qwen3)
+        q = self_attn.q_proj(hidden_states)  # [batch, seq_len, num_heads * head_dim]
+        q = q.view(-1, q.size(1), num_heads, head_dim).transpose(1, 2)  # [batch, num_heads, seq_len, head_dim]
+        
+        k = self_attn.k_proj(hidden_states)  # [batch, seq_len, num_kv_heads * head_dim]
+        k = k.view(-1, k.size(1), num_kv_heads, head_dim).transpose(1, 2)  # [batch, num_kv_heads, seq_len, head_dim]
+        # Repeat K for GQA if needed
+        if num_kv_heads != num_heads:
+            k = k.repeat_interleave(num_heads // num_kv_heads, dim=1)
+    
+    return q, k
+
+@torch.no_grad()
+def calculate_qk_dot_product_kl_divergence(
+    original_model: torch.nn.Module,
+    converted_model: torch.nn.Module,
+    test_loader: DataLoader[dict[str, torch.Tensor]],
+    tokenizer_pad_id: int | None = None,
+) -> dict[int, float]:
+    """
+    Calculate Q K dot product KL divergence between original and converted models.
+    
+    For each layer, this function:
+    1. Captures Q and K from both models during forward pass
+    2. Computes Q @ K^T (dot product) for each layer
+    3. Converts to probability distributions using softmax
+    4. Calculates KL divergence between original and converted distributions
+    
+    Args:
+        original_model: The original non-converted Qwen3-4B model
+        converted_model: The newly converted Qwen3-4B model
+        test_loader: DataLoader for evaluation
+        tokenizer_pad_id: Padding token ID for masking
+        
+    Returns:
+        Dictionary mapping layer index to KL divergence value
+    """
+    import torch.nn.functional as F
+    
+    original_model.eval()
+    converted_model.eval()
+    
+    # Storage for QK dot products per layer
+    original_qk_dot_products = {}
+    converted_qk_dot_products = {}
+    
+    # Process first batch to capture QK dot products
+    for batch_idx, batch in enumerate(test_loader):
+        if batch_idx >= 1:  # Only use first batch for efficiency
+            break
+            
+        batch = map_tensors(batch, original_model.model.embed_tokens.weight.device)
+        input_ids = batch["input_ids"]
+        attention_mask = batch.get("attention_mask")
+        
+        # Get embeddings
+        hidden_states_orig = original_model.model.embed_tokens(input_ids)
+        hidden_states_conv = converted_model.model.embed_tokens(input_ids)
+        
+        # Process each layer
+        for layer_idx in range(len(original_model.model.layers)):
+            # Extract Q and K from original model
+            q_orig, k_orig = extract_qk_from_model(original_model, hidden_states_orig, layer_idx, attention_mask)
+            
+            # Extract Q and K from converted model
+            q_conv, k_conv = extract_qk_from_model(converted_model, hidden_states_conv, layer_idx, attention_mask)
+            
+            # Compute Q @ K^T
+            head_dim = q_orig.size(-1)
+            scaling = head_dim ** -0.5
+            
+            qk_dot_orig = torch.matmul(q_orig, k_orig.transpose(-2, -1)) * scaling
+            qk_dot_conv = torch.matmul(q_conv, k_conv.transpose(-2, -1)) * scaling
+            
+            # Apply attention mask if available
+            if attention_mask is not None:
+                mask = attention_mask.unsqueeze(1).unsqueeze(2)  # [batch, 1, 1, seq_len]
+                qk_dot_orig = qk_dot_orig.masked_fill(mask == 0, float('-inf'))
+                qk_dot_conv = qk_dot_conv.masked_fill(mask == 0, float('-inf'))
+            
+            # Store for this layer
+            if layer_idx not in original_qk_dot_products:
+                original_qk_dot_products[layer_idx] = []
+            if layer_idx not in converted_qk_dot_products:
+                converted_qk_dot_products[layer_idx] = []
+            
+            original_qk_dot_products[layer_idx].append(qk_dot_orig.cpu())
+            converted_qk_dot_products[layer_idx].append(qk_dot_conv.cpu())
+            
+            # Forward through layers to get next hidden states
+            hidden_states_orig = original_model.model.layers[layer_idx](
+                hidden_states_orig, attention_mask=attention_mask
+            )[0]
+            hidden_states_conv = converted_model.model.layers[layer_idx](
+                hidden_states_conv, attention_mask=attention_mask
+            )[0]
+        
+        break  # Only process first batch
+    
+    # Calculate KL divergence for each layer
+    kl_divergences = {}
+    for layer_idx in original_qk_dot_products:
+        if layer_idx not in converted_qk_dot_products:
+            continue
+            
+        # Concatenate all batches for this layer
+        orig_qk = torch.cat(original_qk_dot_products[layer_idx], dim=0)  # [batch, num_heads, seq_len, seq_len]
+        conv_qk = torch.cat(converted_qk_dot_products[layer_idx], dim=0)
+        
+        # Convert to probability distributions using softmax
+        # Apply softmax over the last dimension (seq_len)
+        orig_probs = F.softmax(orig_qk, dim=-1)
+        conv_probs = F.softmax(conv_qk, dim=-1)
+        
+        # Calculate KL divergence: KL(P_original || P_converted)
+        # KL(P||Q) = sum(P * log(P/Q))
+        # Add small epsilon to avoid log(0)
+        eps = 1e-8
+        orig_probs = orig_probs + eps
+        conv_probs = conv_probs + eps
+        
+        # Normalize to ensure they sum to 1
+        orig_probs = orig_probs / orig_probs.sum(dim=-1, keepdim=True)
+        conv_probs = conv_probs / conv_probs.sum(dim=-1, keepdim=True)
+        
+        # Calculate KL divergence
+        kl_div = orig_probs * torch.log(orig_probs / conv_probs)
+        kl_div = kl_div.sum(dim=-1)  # Sum over seq_len dimension
+        
+        # Average over batch, heads, and sequence positions
+        kl_div_mean = kl_div.mean().item()
+        
+        kl_divergences[layer_idx] = kl_div_mean
+    
+    return kl_divergences

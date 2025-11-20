@@ -193,7 +193,7 @@ class PartialRope(nn.Module):
 
 
 
-def partial_rope(model, tokenizer, train_loader, test_loader, **kwargs):
+def partial_rope(model, tokenizer, train_loader, test_loader, original_model=None, **kwargs):
 
     freqfold = kwargs["freqfold"]
     collapse = kwargs["collapse"]
@@ -214,6 +214,37 @@ def partial_rope(model, tokenizer, train_loader, test_loader, **kwargs):
             message = f"Evaluating partial-rope model's ppl, freqfold={freqfold}"
             dataset_ppl = evaluate_ppl(model, tokenizer.pad_token_id, test_loader, message)
             print(f'Partial RoPE ppl, freqfold={freqfold}: {dataset_ppl:.4f}')
+            
+            # Calculate QK dot product KL divergence
+            from utils import calculate_qk_dot_product_kl_divergence
+            import torch
+            
+            # Load original model for comparison
+            orig_model = original_model
+            if orig_model is None:
+                # Need to reload original model
+                from transformers import AutoModelForCausalLM
+                model_path = kwargs.get('model_path')
+                if model_path:
+                    orig_model = AutoModelForCausalLM.from_pretrained(
+                        model_path,
+                        torch_dtype=torch.bfloat16 if kwargs.get('dtype') == 'bf16' else torch.float16,
+                        device_map=kwargs.get('device', 'auto'),
+                        _attn_implementation="sdpa",
+                        trust_remote_code=True,
+                    )
+            
+            if orig_model is not None:
+                kl_divergences = calculate_qk_dot_product_kl_divergence(
+                    orig_model, model, test_loader, tokenizer.pad_token_id
+                )
+                print(f'\nQK Dot Product KL Divergence (Phase 1 Partial_Rope):')
+                for layer_idx, kl_div in sorted(kl_divergences.items()):
+                    print(f'  Layer {layer_idx}: {kl_div:.6f}')
+                if kl_divergences:
+                    avg_kl = sum(kl_divergences.values()) / len(kl_divergences)
+                    print(f'  Average: {avg_kl:.6f}')
+            
             return model, dataset_ppl
         else:
             return model, None

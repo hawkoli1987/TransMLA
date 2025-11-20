@@ -468,5 +468,34 @@ def low_rank_qkv(model, tokenizer, train_loader, test_loader, **kwargs):
         message = "Evaluating lora-qkv model's ppl"
         dataset_ppl = evaluate_ppl(model, tokenizer.pad_token_id, test_loader, message)
         print(f'Low rank approximate QKV ppl: {dataset_ppl:.4f}')
+        
+        # Calculate QK dot product KL divergence
+        from utils import calculate_qk_dot_product_kl_divergence
+        
+        original_model = kwargs.get('original_model')
+        if original_model is None:
+            # Need to reload original model
+            from transformers import AutoModelForCausalLM
+            model_path = kwargs.get('model_path')
+            if model_path:
+                import torch
+                original_model = AutoModelForCausalLM.from_pretrained(
+                    model_path,
+                    torch_dtype=torch.bfloat16 if kwargs.get('dtype') == 'bf16' else torch.float16,
+                    device_map=kwargs.get('device', 'auto'),
+                    _attn_implementation="sdpa",
+                    trust_remote_code=True,
+                )
+        
+        if original_model is not None:
+            kl_divergences = calculate_qk_dot_product_kl_divergence(
+                original_model, model, test_loader, tokenizer.pad_token_id
+            )
+            print(f'\nQK Dot Product KL Divergence (Phase 2 Lora_QKV):')
+            for layer_idx, kl_div in sorted(kl_divergences.items()):
+                print(f'  Layer {layer_idx}: {kl_div:.6f}')
+            if kl_divergences:
+                avg_kl = sum(kl_divergences.values()) / len(kl_divergences)
+                print(f'  Average: {avg_kl:.6f}')
     
     return model
