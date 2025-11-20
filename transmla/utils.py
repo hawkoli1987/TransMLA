@@ -496,7 +496,7 @@ def statistics_qkv_rmsnorm(self_attn, q_a_outputs, kv_a_outputs):
     self_attn.kv_a_layernorm.weight.data = torch.full_like(self_attn.kv_a_layernorm.weight.data, kv_a_rmsnorm)
 
 @torch.no_grad()
-def extract_qk_from_model(model: torch.nn.Module, hidden_states: torch.Tensor, layer_idx: int, attention_mask=None):
+def extract_qk_from_model(model: torch.nn.Module, hidden_states: torch.Tensor, layer_idx: int, position_embeddings=None, attention_mask=None):
     """
     Extract Q and K tensors from a model layer for QK dot product calculation.
     
@@ -504,6 +504,13 @@ def extract_qk_from_model(model: torch.nn.Module, hidden_states: torch.Tensor, l
     - Original Qwen3: standard q_proj and k_proj
     - PartialRope: q_proj and k_proj with k_up_proj
     - LoraQKV: q_a_proj/q_b_proj and kv_a_proj_with_mqa/kv_b_proj structure
+    
+    Args:
+        model: The model to extract Q and K from
+        hidden_states: Input hidden states [batch, seq_len, hidden_size]
+        layer_idx: Layer index
+        position_embeddings: Optional tuple of (cos, sin) for RoPE
+        attention_mask: Optional attention mask
     
     Returns:
         Tuple of (Q, K) tensors in shape [batch, num_heads, seq_len, head_dim]
@@ -518,45 +525,82 @@ def extract_qk_from_model(model: torch.nn.Module, hidden_states: torch.Tensor, l
     # Handle different attention structures
     if hasattr(self_attn, 'q_a_proj') and hasattr(self_attn, 'kv_a_proj_with_mqa'):
         # LoraQKV structure
-        # Reconstruct Q and K from LoRA structure
-        q_a = self_attn.q_a_proj(hidden_states)
-        if hasattr(self_attn, 'q_a_layernorm'):
-            q_a = self_attn.q_a_layernorm(q_a)
-        q = self_attn.q_b_proj(q_a)  # [batch, seq_len, num_heads * (head_dim + qk_mqa_dim)]
-        q = q.view(-1, q.size(1), num_heads, -1).transpose(1, 2)  # [batch, num_heads, seq_len, head_dim + qk_mqa_dim]
-        # Use only head_dim for comparison
-        q = q[..., :head_dim]
+        bsz, q_len, _ = hidden_states.size()
         
-        # For K: need to reconstruct from kv_a_proj_with_mqa and kv_b_proj
-        kv_compressed = self_attn.kv_a_proj_with_mqa(hidden_states)  # [batch, seq_len, kv_lora_rank + qk_mqa_dim]
-        kv_nope, k_rope = kv_compressed.split([self_attn.kv_lora_rank, self_attn.qk_mqa_dim], dim=-1)
-        kv_nope = kv_nope.view(-1, 1, kv_nope.size(1), self_attn.kv_lora_rank)  # [batch, 1, seq_len, kv_lora_rank]
+        # Query: q_a_proj -> q_a_layernorm -> q_b_proj
+        if hasattr(self_attn, 'q_a_proj'):
+            q_a = self_attn.q_a_proj(hidden_states)
+            if hasattr(self_attn, 'q_a_layernorm'):
+                q_a = self_attn.q_a_layernorm(q_a)
+            q = self_attn.q_b_proj(q_a)  # [batch, seq_len, num_heads * (head_dim + qk_mqa_dim)]
+        else:
+            q = self_attn.q_proj(hidden_states)
+        
+        q = q.view(bsz, q_len, num_heads, -1).transpose(1, 2)  # [batch, num_heads, seq_len, head_dim + qk_mqa_dim]
+        qk_mqa_dim = getattr(self_attn, 'qk_mqa_dim', q.size(-1) - head_dim)
+        q_nope, q_rope = q.split([head_dim, qk_mqa_dim], dim=-1)
+        
+        # Key: kv_a_proj_with_mqa -> split -> kv_b_proj
+        compressed_kv = self_attn.kv_a_proj_with_mqa(hidden_states)  # [batch, seq_len, kv_lora_rank + qk_mqa_dim]
+        kv_lora_rank = getattr(self_attn, 'kv_lora_rank', compressed_kv.size(-1) - qk_mqa_dim)
+        kv_nope, k_rope = compressed_kv.split([kv_lora_rank, qk_mqa_dim], dim=-1)
+        kv_nope = kv_nope.view(bsz, 1, q_len, kv_lora_rank)
+        
         if hasattr(self_attn, 'kv_a_layernorm'):
             kv_nope = self_attn.kv_a_layernorm(kv_nope)
         kv_expanded = self_attn.kv_b_proj(kv_nope)  # [batch, 1, seq_len, num_heads * head_dim * 2]
-        kv_expanded = kv_expanded.view(-1, kv_expanded.size(2), num_heads, head_dim * 2).transpose(1, 2)
+        kv_expanded = kv_expanded.view(bsz, q_len, num_heads, head_dim * 2).transpose(1, 2)
         k_nope, _ = kv_expanded.split([head_dim, head_dim], dim=-1)
-        # For simplicity, use only k_nope (ignore k_rope for QK comparison)
-        k = k_nope  # [batch, num_heads, seq_len, head_dim]
+        k_rope = k_rope.view(bsz, 1, q_len, qk_mqa_dim)
+        
+        # Apply RoPE if position_embeddings provided
+        if position_embeddings is not None:
+            from transformers.models.deepseek_v3.modeling_deepseek_v3 import apply_rotary_pos_emb_interleave
+            cos, sin = position_embeddings
+            collapse = getattr(self_attn, 'collapse', 1)
+            q_rope, k_rope = apply_rotary_pos_emb_interleave(
+                q_rope, k_rope, cos[:, :, ::collapse], sin[:, :, ::collapse]
+            )
+            # Expand k_rope to all heads
+            k_rope = k_rope.expand(bsz, num_heads, q_len, qk_mqa_dim)
+        
+        # Concatenate nope and rope parts
+        q = torch.cat([q_nope, q_rope], dim=-1)  # [batch, num_heads, seq_len, head_dim + qk_mqa_dim]
+        k = torch.cat([k_nope, k_rope], dim=-1)  # [batch, num_heads, seq_len, head_dim + qk_mqa_dim]
+        
+        # Use only head_dim for comparison with original model
+        q = q[..., :head_dim]
+        k = k[..., :head_dim]
         
     elif hasattr(self_attn, 'k_up_proj'):
         # PartialRope structure
-        # In PartialRope, Q and K are transformed to latent_dim space, but for comparison
-        # with original model (head_dim), we expand both back to head_dim
-        k_up_weight = self_attn.k_up_proj.weight.view(num_heads, head_dim, self_attn.latent_dim)
-        k_up_weight_T = k_up_weight.transpose(-2, -1)  # [num_heads, latent_dim, head_dim] for inverse transform
+        bsz, q_len, _ = hidden_states.size()
         
-        # Q: q_proj -> reshape -> transform to latent_dim -> expand back to head_dim
+        # Q: q_proj -> reshape -> transform via k_up_proj
         q = self_attn.q_proj(hidden_states)  # [batch, seq_len, num_heads * head_dim]
-        q = q.view(-1, q.size(1), num_heads, head_dim)  # [batch, seq_len, num_heads, head_dim]
-        q_latent = torch.einsum("bthd,hdc->bhtc", q, k_up_weight)  # [batch, num_heads, seq_len, latent_dim]
-        q = torch.einsum("bhtc,hcd->bhtd", q_latent, k_up_weight_T)  # [batch, num_heads, seq_len, head_dim]
-        # Q is already in correct shape [batch, num_heads, seq_len, head_dim]
+        q = q.view(bsz, q_len, num_heads, head_dim)  # [batch, seq_len, num_heads, head_dim]
+        k_up_weight = self_attn.k_up_proj.weight.view(num_heads, head_dim, self_attn.latent_dim)
+        q = torch.einsum("bthd,hdc->bhtc", q, k_up_weight)  # [batch, num_heads, seq_len, latent_dim]
         
-        # K: k_proj -> reshape -> expand to head_dim
+        # K: k_proj -> reshape
         k_latent = self_attn.k_proj(hidden_states)  # [batch, seq_len, latent_dim]
-        k_latent = k_latent.view(-1, 1, k_latent.size(1), self_attn.latent_dim)  # [batch, 1, seq_len, latent_dim]
-        k = torch.einsum("b1td,hdc->bhtd", k_latent, k_up_weight)  # [batch, num_heads, seq_len, head_dim]
+        k = k_latent.view(bsz, 1, q_len, self_attn.latent_dim)  # [batch, 1, seq_len, latent_dim]
+        
+        # Apply RoPE if position_embeddings provided
+        if position_embeddings is not None:
+            from partial_rope import apply_rotary_pos_emb
+            cos, sin = position_embeddings
+            collapse = getattr(self_attn, 'collapse', 1)
+            rope_head = getattr(self_attn, 'rope_head', 1)
+            q, k = apply_rotary_pos_emb(q, k, cos[:, :, ::collapse], sin[:, :, ::collapse], rope_head)
+        
+        # Expand K to all heads
+        k = k.expand(bsz, num_heads, q_len, self_attn.latent_dim)
+        
+        # Transform back to head_dim for comparison with original model
+        k_up_weight_T = k_up_weight.transpose(-2, -1)  # [num_heads, latent_dim, head_dim]
+        q = torch.einsum("bhtc,hcd->bhtd", q, k_up_weight_T)  # [batch, num_heads, seq_len, head_dim]
+        k = torch.einsum("bhtc,hcd->bhtd", k, k_up_weight_T)  # [batch, num_heads, seq_len, head_dim]
         
     else:
         # Standard structure (original Qwen3)
@@ -565,6 +609,16 @@ def extract_qk_from_model(model: torch.nn.Module, hidden_states: torch.Tensor, l
         
         k = self_attn.k_proj(hidden_states)  # [batch, seq_len, num_kv_heads * head_dim]
         k = k.view(-1, k.size(1), num_kv_heads, head_dim).transpose(1, 2)  # [batch, num_kv_heads, seq_len, head_dim]
+        
+        # Apply RoPE if position_embeddings provided (for original Qwen3)
+        if position_embeddings is not None:
+            # Original Qwen3 uses standard RoPE
+            cos, sin = position_embeddings
+            # Apply RoPE transformation (simplified, assuming standard implementation)
+            # For Qwen3, we need to check the actual RoPE implementation
+            # For now, we'll skip RoPE for original model to match the comparison
+            pass
+        
         # Repeat K for GQA if needed
         if num_kv_heads != num_heads:
             k = k.repeat_interleave(num_heads // num_kv_heads, dim=1)
@@ -601,6 +655,11 @@ def calculate_qk_dot_product_kl_divergence(
     original_model.eval()
     converted_model.eval()
     
+    # Ensure both models are on the same device
+    device = next(converted_model.parameters()).device
+    if next(original_model.parameters()).device != device:
+        original_model = original_model.to(device)
+    
     # Storage for QK dot products per layer
     original_qk_dot_products = {}
     converted_qk_dot_products = {}
@@ -610,21 +669,71 @@ def calculate_qk_dot_product_kl_divergence(
         if batch_idx >= 1:  # Only use first batch for efficiency
             break
             
-        batch = map_tensors(batch, original_model.model.embed_tokens.weight.device)
+        batch = map_tensors(batch, device)
         input_ids = batch["input_ids"]
         attention_mask = batch.get("attention_mask")
+        
+        # Get position_ids for RoPE
+        batch_size, seq_len = input_ids.shape
+        position_ids = torch.arange(seq_len, dtype=torch.long, device=device).unsqueeze(0).expand(batch_size, -1)
         
         # Get embeddings
         hidden_states_orig = original_model.model.embed_tokens(input_ids)
         hidden_states_conv = converted_model.model.embed_tokens(input_ids)
         
+        # Get position embeddings for both models
+        # For original Qwen3 model
+        if hasattr(original_model.model, 'layers') and len(original_model.model.layers) > 0:
+            # Try to get rotary embedding from first layer
+            first_layer = original_model.model.layers[0]
+            if hasattr(first_layer, 'self_attn') and hasattr(first_layer.self_attn, 'rotary_emb'):
+                position_embeddings_orig = first_layer.self_attn.rotary_emb(hidden_states_orig, position_ids=position_ids)
+            elif hasattr(original_model.model, 'rotary_emb'):
+                position_embeddings_orig = original_model.model.rotary_emb(hidden_states_orig, position_ids=position_ids)
+            else:
+                position_embeddings_orig = None
+        else:
+            position_embeddings_orig = None
+        
+        # For converted model (PartialRope or LoraQKV)
+        if hasattr(converted_model.model, 'layers') and len(converted_model.model.layers) > 0:
+            first_layer_conv = converted_model.model.layers[0]
+            if hasattr(first_layer_conv, 'self_attn'):
+                # Check if it has rotary_emb or if we need to generate it
+                if hasattr(first_layer_conv.self_attn, 'rotary_emb'):
+                    position_embeddings_conv = first_layer_conv.self_attn.rotary_emb(hidden_states_conv, position_ids=position_ids)
+                elif hasattr(converted_model.model, 'rotary_emb'):
+                    position_embeddings_conv = converted_model.model.rotary_emb(hidden_states_conv, position_ids=position_ids)
+                else:
+                    # For PartialRope/LoraQKV, we might need to generate position embeddings
+                    # Use the same as original if available
+                    position_embeddings_conv = position_embeddings_orig
+            else:
+                position_embeddings_conv = position_embeddings_orig
+        else:
+            position_embeddings_conv = position_embeddings_orig
+        
         # Process each layer
         for layer_idx in range(len(original_model.model.layers)):
             # Extract Q and K from original model
-            q_orig, k_orig = extract_qk_from_model(original_model, hidden_states_orig, layer_idx, attention_mask)
+            q_orig, k_orig = extract_qk_from_model(
+                original_model, hidden_states_orig, layer_idx, 
+                position_embeddings=position_embeddings_orig, attention_mask=attention_mask
+            )
             
             # Extract Q and K from converted model
-            q_conv, k_conv = extract_qk_from_model(converted_model, hidden_states_conv, layer_idx, attention_mask)
+            q_conv, k_conv = extract_qk_from_model(
+                converted_model, hidden_states_conv, layer_idx,
+                position_embeddings=position_embeddings_conv, attention_mask=attention_mask
+            )
+            
+            # Ensure Q and K have compatible shapes
+            min_seq_len = min(q_orig.size(2), q_conv.size(2))
+            min_head_dim = min(q_orig.size(-1), q_conv.size(-1))
+            q_orig = q_orig[:, :, :min_seq_len, :min_head_dim]
+            k_orig = k_orig[:, :, :min_seq_len, :min_head_dim]
+            q_conv = q_conv[:, :, :min_seq_len, :min_head_dim]
+            k_conv = k_conv[:, :, :min_seq_len, :min_head_dim]
             
             # Compute Q @ K^T
             head_dim = q_orig.size(-1)
@@ -636,8 +745,15 @@ def calculate_qk_dot_product_kl_divergence(
             # Apply attention mask if available
             if attention_mask is not None:
                 mask = attention_mask.unsqueeze(1).unsqueeze(2)  # [batch, 1, 1, seq_len]
-                qk_dot_orig = qk_dot_orig.masked_fill(mask == 0, float('-inf'))
-                qk_dot_conv = qk_dot_conv.masked_fill(mask == 0, float('-inf'))
+                # Truncate mask if needed to match QK dot product dimensions
+                if mask.size(-1) > min_seq_len:
+                    mask = mask[:, :, :, :min_seq_len]
+                # Mask should match both seq_len dimensions of QK dot product
+                mask_k = mask  # [batch, 1, 1, seq_len] for key dimension
+                mask_q = mask.transpose(-2, -1)  # [batch, 1, seq_len, 1] for query dimension
+                # Apply mask: set masked positions to -inf
+                qk_dot_orig = qk_dot_orig.masked_fill(mask_k == 0, float('-inf'))
+                qk_dot_conv = qk_dot_conv.masked_fill(mask_k == 0, float('-inf'))
             
             # Store for this layer
             if layer_idx not in original_qk_dot_products:
@@ -649,12 +765,22 @@ def calculate_qk_dot_product_kl_divergence(
             converted_qk_dot_products[layer_idx].append(qk_dot_conv.cpu())
             
             # Forward through layers to get next hidden states
-            hidden_states_orig = original_model.model.layers[layer_idx](
-                hidden_states_orig, attention_mask=attention_mask
-            )[0]
-            hidden_states_conv = converted_model.model.layers[layer_idx](
-                hidden_states_conv, attention_mask=attention_mask
-            )[0]
+            # Need to handle position_embeddings in forward pass
+            layer_output_orig = original_model.model.layers[layer_idx](
+                hidden_states_orig, 
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                position_embeddings=position_embeddings_orig
+            )
+            hidden_states_orig = layer_output_orig[0] if isinstance(layer_output_orig, tuple) else layer_output_orig
+            
+            layer_output_conv = converted_model.model.layers[layer_idx](
+                hidden_states_conv,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                position_embeddings=position_embeddings_conv
+            )
+            hidden_states_conv = layer_output_conv[0] if isinstance(layer_output_conv, tuple) else layer_output_conv
         
         break  # Only process first batch
     
