@@ -605,15 +605,15 @@ def evaluate_ppl(
     logging.info(message)
     try:
         for batch_idx, batch in enumerate(tqdm(testloader, desc=message)):
-            # Stop if we've collected enough sequences for QK monitoring
-            if qk_monitor is not None and qk_monitor._sequence_count >= qk_monitor.max_sequences:
-                break
-                
             logging.debug(f"Evaluating batch {len(nlls)}")
-            if qk_monitor is not None:
+            
+            # Only start batch tracking if we still need to collect QK data
+            # But always continue perplexity evaluation for full test set
+            if qk_monitor is not None and qk_monitor._sequence_count < qk_monitor.max_sequences:
                 # Mark start of new batch to track sequences separately
                 batch_size = batch["input_ids"].shape[0] if isinstance(batch, dict) and "input_ids" in batch else 1
                 qk_monitor.start_batch(batch_size)
+            
             batch = map_tensors(batch, model.model.embed_tokens.weight.device)
             logits = model(**batch, use_cache=False).logits
 
@@ -627,6 +627,10 @@ def evaluate_ppl(
             mask = shift_labels != loss_fn.ignore_index
             nll_means = (nll * mask).sum(dim=1) / mask.sum(dim=1)
             nlls.append(nll_means)
+            
+            # Disable QK monitoring after collecting enough sequences, but continue perplexity evaluation
+            if qk_monitor is not None and qk_monitor._sequence_count >= qk_monitor.max_sequences:
+                _ScaledDotProductAttentionCapture.disable(qk_monitor)
     finally:
         if qk_monitor is not None:
             _ScaledDotProductAttentionCapture.disable(qk_monitor)
