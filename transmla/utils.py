@@ -451,18 +451,26 @@ def compute_qk_kl_divergence(
     max_sequences: int = 10,
 ) -> float | None:
     """
-    Approximate KL(reference || target) using histograms of dot products.
-    Computes KL divergence per sequence, then averages over sequences.
+    Compute KL(reference || target) using softmax-normalized attention scores.
+    
+    For each head's [L, L] attention score matrix:
+    1. Apply softmax to each row (creating probability distributions over keys)
+    2. Compute KL divergence for each row: KL(P||Q) = sum(P * log(P / Q))
+       where P is reference (baseline) and Q is target
+    3. Average KL across all rows for that head
+    4. Average KL across all heads (and sequences and layers)
+    
+    Also prints statistics (max, avg, min) for the first sequence/layer/head.
     
     Args:
         reference_monitor: Monitor with reference (Phase 0) data
         target_monitor: Monitor with target (Phase 1 or 2) data
-        bins: Number of histogram bins
+        bins: Not used (kept for compatibility)
         epsilon: Small value to avoid log(0)
         max_sequences: Maximum number of sequences to use (default 10)
     
     Returns:
-        Average KL divergence across sequences, or None if insufficient data
+        Average KL divergence across all heads, or None if insufficient data
     """
     if reference_monitor is None or target_monitor is None:
         return None
@@ -482,6 +490,9 @@ def compute_qk_kl_divergence(
     # New approach: compute KL per head, then average
     # Structure: reference_heads[seq_idx][layer_idx][head_idx] = tensor[L*L]
     all_head_kl_values = []
+    
+    # Statistics for the first sequence, first layer, first head (for reporting)
+    stats_printed = False
     
     for seq_idx in range(num_sequences):
         reference_heads = reference_monitor.get_sequence_head_tensors(seq_idx)  # list[list[tensor]]
@@ -523,10 +534,23 @@ def compute_qk_kl_divergence(
                     ref_head = ref_head.reshape(L, L)
                     tgt_head = tgt_head.reshape(L, L)
                 
+                # Print statistics for the first head (once)
+                if not stats_printed:
+                    ref_max = ref_head.max().item()
+                    ref_min = ref_head.min().item()
+                    ref_avg = ref_head.mean().item()
+                    tgt_max = tgt_head.max().item()
+                    tgt_min = tgt_head.min().item()
+                    tgt_avg = tgt_head.mean().item()
+                    print(f"QK Dot Product Statistics (seq_{seq_idx}, layer_{layer_idx}, head_{head_idx}):")
+                    print(f"  Reference matrix: max={ref_max:.6f}, avg={ref_avg:.6f}, min={ref_min:.6f}")
+                    print(f"  Target matrix:    max={tgt_max:.6f}, avg={tgt_avg:.6f}, min={tgt_min:.6f}")
+                    stats_printed = True
+                
                 L = ref_head.shape[0]
                 head_row_kl_values = []
                 
-                # Compute KL for each row separately
+                # Apply softmax to each row, then compute KL divergence
                 for row_idx in range(L):
                     ref_row = ref_head[row_idx]  # [L]
                     tgt_row = tgt_head[row_idx]  # [L]
@@ -534,32 +558,13 @@ def compute_qk_kl_divergence(
                     if ref_row.numel() == 0 or tgt_row.numel() == 0:
                         continue
                     
-                    # Find shared min/max for this row pair
-                    min_val = torch.minimum(ref_row.min(), tgt_row.min()).item()
-                    max_val = torch.maximum(ref_row.max(), tgt_row.max()).item()
+                    # Apply softmax to each row (probability distribution over keys)
+                    ref_row_softmax = torch.nn.functional.softmax(ref_row, dim=-1)  # [L]
+                    tgt_row_softmax = torch.nn.functional.softmax(tgt_row, dim=-1)  # [L]
                     
-                    if not (math.isfinite(min_val) and math.isfinite(max_val)):
-                        continue
-                    if min_val == max_val:
-                        head_row_kl_values.append(0.0)
-                        continue
-                    
-                    span = max_val - min_val
-                    margin = max(span * 0.01, 1e-3)
-                    hist_min = min_val - margin
-                    hist_max = max_val + margin
-                    
-                    # Compute histograms for this row
-                    reference_hist = torch.histc(ref_row, bins=bins, min=hist_min, max=hist_max)
-                    target_hist = torch.histc(tgt_row, bins=bins, min=hist_min, max=hist_max)
-                    
-                    if reference_hist.sum() == 0 or target_hist.sum() == 0:
-                        continue
-                    
-                    reference_prob = reference_hist / reference_hist.sum()
-                    target_prob = target_hist / target_hist.sum()
-                    
-                    kl = torch.sum(reference_prob * torch.log((reference_prob + epsilon) / (target_prob + epsilon)))
+                    # Compute KL divergence: KL(P||Q) = sum(P * log(P / Q))
+                    # where P is reference (baseline) and Q is target
+                    kl = torch.sum(ref_row_softmax * torch.log((ref_row_softmax + epsilon) / (tgt_row_softmax + epsilon)))
                     head_row_kl_values.append(kl.item())
                 
                 # Average KL across all rows for this head
