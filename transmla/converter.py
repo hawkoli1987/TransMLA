@@ -88,7 +88,10 @@ def main(args):
     original_model_for_kl = deepcopy(model)
     original_model_for_kl = original_model_for_kl.to("cpu")  # Move to CPU to save memory
     
-    model = partial_rope(model, tokenizer, train_loader, test_loader, original_model=original_model_for_kl, model_path=args.model_path, dtype=args.dtype, device=args.device, **vars(args))
+    # Create kwargs dict, adding original_model which is not in args
+    kwargs = vars(args).copy()
+    kwargs['original_model'] = original_model_for_kl
+    model = partial_rope(model, tokenizer, train_loader, test_loader, **kwargs)
     if args.freqfold == "auto":
         args.freqfold = model[1]
         model = model[0]
@@ -100,7 +103,10 @@ def main(args):
     print("LoraQKV Model".center(60))
     print("="*60 + "\n")
 
-    model = low_rank_qkv(model, tokenizer, train_loader, test_loader, original_model=original_model_for_kl, model_path=args.model_path, dtype=args.dtype, device=args.device, **vars(args))
+    # Create kwargs dict, adding original_model which is not in args
+    kwargs = vars(args).copy()
+    kwargs['original_model'] = original_model_for_kl
+    model = low_rank_qkv(model, tokenizer, train_loader, test_loader, **kwargs)
 
     # save model
     print(f"\nSaving model and tokenizer to {args.save_path}...")
