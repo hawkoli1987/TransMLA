@@ -84,6 +84,7 @@ def modify_config(model, config_path: str, args):
     config["kv_lora_rank"] = args.kv_lora_rank
 
     config["qk_latent_layernorm"] = hasattr(model.model.layers[0].self_attn, "kv_a_layernorm")
+    config["use_qk_head_norm"] = getattr(model.model.layers[0].self_attn, "q_norm", None) is not None
 
     with open(config_path, "w") as f:
         json.dump(config, f, indent=4)

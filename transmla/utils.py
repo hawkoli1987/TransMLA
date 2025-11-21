@@ -665,12 +665,19 @@ def insert_qkv_hooks(model):
     q_a_proj_outputs = {}
     kv_a_proj_with_mqa_outputs = {}
 
+    def _flatten_attention_output(output: torch.Tensor) -> torch.Tensor:
+        if isinstance(output, torch.Tensor) and output.dim() > 3:
+            return output.reshape(output.shape[0], output.shape[1], -1)
+        return output
+
     def query_hook_fn(module, input, output, index):
+        output = _flatten_attention_output(output)
         if index not in query_outputs:
             query_outputs[index] = []
         query_outputs[index].append(output.to('cpu'))
 
     def key_hook_fn(module, input, output, index):
+        output = _flatten_attention_output(output)
         if index not in key_outputs:
             key_outputs[index] = []
         key_outputs[index].append(output.to('cpu'))
@@ -691,11 +698,13 @@ def insert_qkv_hooks(model):
         kv_a_proj_with_mqa_outputs[index].append(output.to('cpu'))
 
     for idx, layer in enumerate(model.model.layers):
-        if hasattr(layer.self_attn, "q_proj"):
-            query_hook = layer.self_attn.q_proj.register_forward_hook(lambda module, input, output, idx=idx: query_hook_fn(module, input, output, idx))
+        query_source = layer.self_attn.q_norm if hasattr(layer.self_attn, "q_norm") else getattr(layer.self_attn, "q_proj", None)
+        if query_source is not None:
+            query_hook = query_source.register_forward_hook(lambda module, input, output, idx=idx: query_hook_fn(module, input, output, idx))
             query_hooks.append(query_hook)
-        if hasattr(layer.self_attn, "k_proj"):
-            key_hook = layer.self_attn.k_proj.register_forward_hook(lambda module, input, output, idx=idx: key_hook_fn(module, input, output, idx))
+        key_source = layer.self_attn.k_norm if hasattr(layer.self_attn, "k_norm") else getattr(layer.self_attn, "k_proj", None)
+        if key_source is not None:
+            key_hook = key_source.register_forward_hook(lambda module, input, output, idx=idx: key_hook_fn(module, input, output, idx))
             key_hooks.append(key_hook)
         if hasattr(layer.self_attn, "v_proj"):
             value_hook = layer.self_attn.v_proj.register_forward_hook(lambda module, input, output, idx=idx: value_hook_fn(module, input, output, idx))
